@@ -30,18 +30,15 @@ function ENT:Draw()
 
     if not map then return end
 
-    local offset = self:GetPos() + Vector(0, 0, self:GetHeight())
-
-    local ang = Angle(0, 0, 0)
-    local pos = EyePos() - offset
-
-    pos:Rotate(ang)
-
     render.PushFilterMag(TEXFILTER.ANISOTROPIC)
     render.PushFilterMin(TEXFILTER.ANISOTROPIC)
     render.SetLightingMode(2)
 
-    cam.Start3D(pos, EyeAngles())
+    local m = Matrix()
+    m:Translate(self:GetPos() + Vector(0, 0, self:GetHeight()))
+    m:Rotate(self:GetAngles())
+
+    cam.PushModelMatrix(m)
         for k, v in ipairs(map.meshes) do
             render.SetMaterial(map.materials[k])
             v:Draw()
@@ -66,7 +63,7 @@ function ENT:Draw()
                 v:DrawModel()
             end
         end
-    cam.End3D()
+    cam.PopModelMatrix()
 
     render.SetLightingMode(0)
     render.PopFilterMin()
