@@ -11,7 +11,7 @@ include('includes/modules/sh_bsptypes.lua')
 include('includes/modules/sh_bsp2.lua')
 
 if CLIENT then
-    local scale = 1 / 250
+    local scale = 1
 
     local MESHES = {}
     local MATERIALS = {}

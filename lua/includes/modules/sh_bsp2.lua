@@ -443,11 +443,11 @@ function LoadBSP( bsp, path, lumps, callback )
 
 		local t = task.New( load, 1 )
 		function t:chunk( name, count )
-			Msg("LOADING: " .. string.upper(name) .. " : " .. count .. " " )
+			-- Msg("LOADING: " .. string.upper(name) .. " : " .. count .. " " )
 		end
 
 		function t:sub(name)
-			Msg("\n\t" .. string.upper(name))
+			-- Msg("\n\t" .. string.upper(name))
 		end
 
 		function t:progress()
@@ -455,7 +455,7 @@ function LoadBSP( bsp, path, lumps, callback )
 		end
 
 		function t:chunkdone( name, count, tab )
-			Msg("DONE\n")
+			-- Msg("DONE\n")
 		end
 
 		bspdata.__task = t
