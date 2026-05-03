@@ -7,7 +7,7 @@ module( "task", package.seeall )
 local TASK_TIME_SLICE = 0.008
 local HITCH_THESHOLD = 0.05
 local MAX_TASK_ITERATIONS = 100000
-local TASK_HITCH_DETECTION = true
+local TASK_HITCH_DETECTION = false
 local TASK_PRIORITIZATION = true
 
 tasks = tasks or {}
@@ -313,19 +313,19 @@ local function ProcessTasks()
 
 	if not TASK_HITCH_DETECTION then return end
 
-	if task_died then
-		--print("TASK DIED")
-	elseif task_slept then
-		--print("TASK SLEPT")
-	elseif #tasks == 0 then
-		--print("TASKS EXHAUSTED")
-	elseif remaining_iterations == 0 then
-		--print("ITERATIONS EXHAUSTED")
-	elseif task_yielded_timeslice then
-		--print("TIMESLICE EXHAUSTED")
-	else
-		--print("SOMETHING")
-	end
+	-- if task_died then
+	-- 	print("TASK DIED")
+	-- elseif task_slept then
+	-- 	print("TASK SLEPT")
+	-- elseif #tasks == 0 then
+	-- 	print("TASKS EXHAUSTED")
+	-- elseif remaining_iterations == 0 then
+	-- 	print("ITERATIONS EXHAUSTED")
+	-- elseif task_yielded_timeslice then
+	-- 	print("TIMESLICE EXHAUSTED")
+	-- else
+	-- 	print("SOMETHING")
+	-- end
 
 	local delta = SysTime() - start
 	if delta > HITCH_THESHOLD then
