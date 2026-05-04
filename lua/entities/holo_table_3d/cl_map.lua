@@ -290,6 +290,7 @@ local CACHE_GENERATION = SysTime()
 -- shared by BuildClippedMap and the background tri-cache prewarm. Keyed
 -- by tinfo identity, gen-stamped against CACHE_GENERATION so a hot
 -- reload purges them lazily on next access.
+--- @type { gen: number, [Face]: IMaterial }
 local matCacheGlobal     = { gen = CACHE_GENERATION }
 local skipCacheGlobal    = { gen = CACHE_GENERATION }
 local projCacheGlobal    = { gen = CACHE_GENERATION }
@@ -2510,6 +2511,7 @@ end
 -- (scale * (25 - height) + pivotZ) lands at the BSP altitude of mins.z
 -- plus a 1-unit clearance, matching the table's GPU floor plane.
 -- Returns nil when bsp2 has no current map.
+--- @return number, number, number, number
 function ENT:ComputeAutoCenter()
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.models or not bsp.models[1] then return end

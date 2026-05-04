@@ -1,0 +1,28 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+
+        - name: Setup
+          id: setup
+          uses: juliangruber/read-file-action@v1
+          with:
+            path: ./README.md
+
+        - name: Publish
+          uses: gmod-workshop/workshop-upload@v1
+          with:
+            username: ${{ secrets.STEAM_USERNAME }}
+            vdf: ${{ secrets.STEAM_VDF }}
+            id: ${{ secrets.WORKSHOP_ID }}
+            folder: .
+            changelog: "${{ github.event.release.body }}"
+            description: "${{ steps.setup.outputs.content }}"

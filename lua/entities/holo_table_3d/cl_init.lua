@@ -195,8 +195,8 @@ function ENT:DrawHologram()
         self.Mask:Draw()
     cam.PopModelMatrix()
 
-    render.OverrideDepthEnable(false)
-    render.OverrideColorWriteEnable(false)
+    render.OverrideDepthEnable(false, false)
+    render.OverrideColorWriteEnable(false, false)
 
     -- Begin actual drawing of meshes using set stencil
 

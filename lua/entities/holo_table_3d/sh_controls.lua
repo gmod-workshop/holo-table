@@ -137,6 +137,7 @@ local SCALE_MIN, SCALE_MAX   = 1, 300
 local HEIGHT_MIN, HEIGHT_MAX = -500, 500
 local PAN_MIN, PAN_MAX       = -16384, 16384
 
+--- @type Entity?
 local controlled    = nil
 local nextSendTime  = 0
 local dirty         = false
@@ -164,6 +165,7 @@ net.Receive('holo_table_control', function()
     end
 end)
 
+--- @param ent Entity
 local function sendParams(ent)
     net.Start('holo_table_setparams')
     net.WriteEntity(ent)
@@ -177,6 +179,7 @@ end
 -- Edge-triggered layer toggles bypass the throttled setparams send so
 -- the visibility flip is immediate. Optimistic local write mirrors the
 -- pattern used everywhere else in this file.
+--- @param ent Entity
 local function sendLayers(ent)
     net.Start('holo_table_setlayers')
     net.WriteEntity(ent)
@@ -223,6 +226,7 @@ end
 -- Optimistic local write so the table snaps the same frame; server
 -- replays with the (clamped) authoritative values within ~RTT. Returns
 -- true if a message was sent. ENT:ComputeAutoCenter lives in cl_map.
+--- @param ent Entity
 local function sendAutoCenter(ent)
     if not (IsValid(ent) and ent.ComputeAutoCenter) then return false end
     local scale, panX, panY, height = ent:ComputeAutoCenter()
@@ -361,6 +365,9 @@ hook.Add('PlayerBindPress', 'holo_table_3d.Controls', function(ply, bind, presse
     end
 end)
 
+--- @param cmd string
+--- @param fallback string
+--- @return string
 local function bindKey(cmd, fallback)
     local k = input.LookupBinding(cmd)
     return k and string.upper(k) or fallback
