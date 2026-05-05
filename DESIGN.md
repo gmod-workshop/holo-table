@@ -12,6 +12,13 @@ lifecycle hooks (`InitializeMap`, `ThinkRadar`, etc.) on `ENT`. This
 keeps `cl_init.lua` as a thin coordinator and makes each subsystem
 independently movable / replaceable.
 
+- `lua/autorun/bsp2.lua` — NikNaks-backed adapter. The old vendored BSP
+  parser has been removed, but this file preserves the narrow `bsp2`
+  surface the holo table already consumes: `GetCurrent`,
+  `GetModelInfo`, `bsp2_rebuild`, and `CurrentBSPReady`. It adapts
+  NikNaks bmodels/faces/texinfo/static props into the existing table
+  shape and creates per-texinfo `UnlitGeneric` fallback materials for
+  lightmap-free holo rendering.
 - `shared.lua` — `ENT.Type`/`Base`/metadata + `SetupDataTables`.
 - `init.lua` — server-side `Initialize` (sets `SIMPLE_USE`),
   `ENT:Use`/`ReleaseController`/`OnRemove` ownership handling,
@@ -19,8 +26,10 @@ independently movable / replaceable.
   receivers (`holo_table_autocenter`, `holo_table_setparams`,
   `holo_table_setlayers`, `holo_table_release`), and `AddCSLuaFile`
   for every client component including a loop over `radar/*.lua`.
-  Net receivers are ownership-gated and clamped to the NetworkVar
-  limits in `shared.lua`.
+  `setparams` / `setlayers` / `release` are ownership-gated;
+  `setparams` and `autocenter` are clamped to the NetworkVar limits in
+  `shared.lua`. `autocenter` is blocked when the table is controlled by
+  someone else, while remaining usable on unowned tables.
 - `cl_init.lua` — slim coordinator (~375 lines).
   `Initialize` / `Think` / `OnRemove` delegate to per-subsystem
   hooks. `Draw` only calls `DrawModel` so `halo.Render`'s opaque
@@ -130,9 +139,9 @@ would render at the BSP origin if included here.
 that pass the trivial-accept test (fully inside the cylinder) only ever
 need triangulating + UV-projecting once; the resulting per-vertex
 `{pos, normal, u, v}` table list is invariant across scale/pan/height
-and lives directly on the bsp2 face for the rest of the map load. The
-fast path is then "look up cache → `table.move` the tris into the
-material group's vert list", with a one-shot `lastGroups`/`lastGroup`
+and lives directly on the adapted face table for the rest of the map
+load. The fast path is then "look up cache → `table.move` the tris into
+the material group's vert list", with a one-shot `lastGroups`/`lastGroup`
 ref to skip the per-face hash lookup. On
 `rp_venator_extensive_v1_4` (~21 k faces, ~99.95 % fully-interior at
 the auto-centered framing) this drops the clip phase from ~470 ms to
@@ -145,6 +154,14 @@ prints stage-by-stage timings (`clip` vs `imesh`), face counts
 (`checked / skipped / cut`), and output (`tris / meshes`). The output
 list is freed without touching the live build pipeline so profiling is
 side-effect-free.
+
+**Decision:** `cl_map.lua` owns an explicit hot-reload cleanup hook via
+`_G.HOLO_TABLE_3D_CL_MAP_CLEANUP`. On file load it runs the previous
+generation's cleanup before installing the new one, freeing shared
+static/dynamic prop bakes, brush mesh caches, prewarm hooks, and cached
+clientside draw entities. This keeps Lua auto-refresh from stranding
+IMesh/csent resources during development without adding work to the
+frame hot paths.
 
 ## Prop and brush-entity rendering
 
@@ -171,7 +188,9 @@ global GPU-clipped bake was ~0.085 ms/frame.
 
 **Decision:** Legacy static prop fallback stays. Disabled bake, mode `0`,
 and rebuild windows still use per-prop `Entity:DrawModel` in world space,
-with a file-level `ClientsideModel` cache keyed by model path.
+with a file-level `ClientsideModel` cache keyed by model path. Bounds and
+sub-pixel culling come from `util.GetModelInfo` so prewarm does not spawn
+throwaway clientside entities.
 
 **Rejected: `cam.PushModelMatrix` around `DrawModel`.** `Entity:DrawModel`
 ignores the model matrix stack, so props would render at their raw BSP
@@ -180,14 +199,16 @@ per prop is cheap and works.
 
 **Decision:** `render.SuppressEngineLighting(true)` during the prop draw
 loop / baked mesh draw. Static props use `VertexLitGeneric`, while the
-bsp2 worldspawn materials are `UnlitGeneric` — without suppression the
-props look noticeably darker than the surrounding mesh.
+adapter's worldspawn fallback materials are `UnlitGeneric` — without
+suppression the props look noticeably darker than the surrounding mesh.
 
 **Decision:** `prop_dynamic` map dressing belongs to the map subsystem,
 not radar. Most map `prop_dynamic`s are static visual dressing, so
 `cl_map.lua` owns an async baked IMesh path for horizontally all-in views
-plus a per-table csent fallback for partial views, disabled bake, rebuild
-windows, or individual moving props. A 1-second watcher compares
+plus a per-table csent fallback for partial views, disabled bake, or
+individual moving props. While an all-in bake is queued/building, the
+baked path suppresses the fallback instead of spawning temporary mirrors.
+A 1-second watcher compares
 `EntIndex`, model, skin, position, and angles; added/removed/reskinned
 stable props trigger an async rebuild while the previous bake keeps
 drawing. Props observed moving/rotating are marked unbaked and drawn by
@@ -208,8 +229,8 @@ per-entity matrix is just `T(GetPos()) * R(GetAngles())` composed on top
 of the holo scene matrix via `cam.PushModelMatrix(m, true)`.
 
 **Decision:** Per-bmodel mesh cache shared across all `holo_table_3d`
-instances, cleared on the `CurrentBSPReady` hook. Brush models are
-map-stable; multiple holo tables can reuse the same `IMesh`.
+instances, cleared on the adapter's `CurrentBSPReady` hook. Brush models
+are map-stable; multiple holo tables can reuse the same `IMesh`.
 
 ## Radar system
 
@@ -360,10 +381,13 @@ press edge.
 **Decision:** Server is the source of truth for ownership and the
 final NetworkVar values. Client writes to NetworkVars optimistically
 on every input event so the table reacts the same frame; the
-server's snapshot replays the (clamped, ownership-checked)
-authoritative value within ~RTT. `holo_table_setparams` is throttled
-to ~30 Hz (`SEND_INTERVAL = 0.033`) when `dirty`; `holo_table_setlayers`
-and `holo_table_autocenter` ship immediately on the edge.
+server's snapshot replays the ordinary control input
+(`holo_table_setparams`) after clamping / ownership checks within
+~RTT. `holo_table_setparams` is throttled to ~30 Hz
+(`SEND_INTERVAL = 0.033`) when `dirty`; `holo_table_setlayers` and
+`holo_table_autocenter` ship immediately on the edge. `autocenter`
+still uses client-computed fit params, but the server clamps them and
+rejects attempts to change a table controlled by another player.
 
 **Rejected: Server-authoritative input (write only on snapshot
 arrival).** Adds RTT/2 of input lag to every pan/scroll, which is
@@ -425,17 +449,44 @@ calls it; `PlayerDisconnected` walks every holo table and releases
 any owned by the leaver. Stale controllers would otherwise wedge
 a table forever.
 
+## BSP Adapter
+
+**Decision:** Depend on NikNaks for BSP parsing and keep a local `bsp2`
+compatibility adapter. The old vendored parser has been stripped out,
+but `cl_map.lua` still talks to `bsp2.GetCurrent()` and
+`bsp2.GetModelInfo()` because that surface is small and stable. The
+adapter lives in `lua/autorun/bsp2.lua`, `require`s `niknaks`, maps
+NikNaks bmodel `0` to `models[1]` (worldspawn), bmodels `1..N` to
+`models[2..]`, adapts face edges/planes/texinfo into the old shape,
+and exposes static props as `{model, origin, angles, skin}`.
+
+**Decision:** Preserve `CurrentBSPReady` and `bsp2_rebuild`. Existing
+holo-table cache invalidation is already wired to `CurrentBSPReady`
+(brush mesh cache, material lookup identity, prewarm paths), so the
+adapter keeps that event instead of introducing a NikNaks-specific
+hook into every subsystem. `bsp2_rebuild` clears the adapter's current
+map state and rebuilds the material list, which is useful while testing
+parser/material changes in a live client.
+
+**Trade-off:** The adapter is intentionally not a general replacement
+for the removed parser. It only implements the parts this addon uses:
+world/brush faces, model bounds/origins, static props, texinfo
+projection data, and per-texinfo fallback materials. New BSP features
+should either extend this narrow adapter deliberately or call NikNaks
+directly from a clearly isolated subsystem.
+
 ## Material handling
 
-**Decision:** Hybrid — bsp2's regenerated `UnlitGeneric` materials for
+**Decision:** Hybrid — adapter-generated `UnlitGeneric` materials for
 faces whose original shader was `LightmappedGeneric` (which would render
 black without a lightmap), original VMTs otherwise. Resolved once per
-texinfo and cached.
+texinfo and cached in `cl_map.lua`.
 
 **Decision:** Group draws by `$basetexture` name, falling back to
-material name. bsp2 emits one unique material per texinfo (so the same
-texture tiled across many faces becomes many materials); grouping by
-texture collapses these back into one render batch.
+material name. The adapter emits one unique fallback material per
+texinfo (so the same texture tiled across many faces becomes many
+materials); grouping by texture collapses these back into one render
+batch.
 
 **Decision:** Cache the `mi.materials → matByTexinfo` lookup table at
 file scope, keyed by the `mi.materials` table identity. The lookup
@@ -443,8 +494,8 @@ itself is just a `mat:GetName()` loop, but on big maps that list is
 huge (rp_venator: 5934 entries) and the loop costs ~230 ms — paid on
 every `BuildClippedMap` call before this was hoisted. Reusing the
 cache across builds drops worldspawn clip time on Venator from
-~245 ms to ~10 ms (24x). Auto-invalidates whenever bsp2 swaps the
-materials list (i.e. on map load), no explicit hook required.
+~245 ms to ~10 ms (24x). Auto-invalidates whenever the adapter swaps
+the materials list, no explicit hook required.
 
 **Decision:** `loadTexdataMaterial(name)` strips a stray leading `/`
 from BSP texdata paths and re-`Material()`s. Some maps (rp_finalizer)
@@ -454,22 +505,25 @@ the filter set, and the affected faces silently disappear from the
 holo. The strip-and-retry is in the per-texinfo resolve so the cost
 is paid at most once per material per map load.
 
-**Decision:** `unlitWrap(src)` builds a runtime `UnlitGeneric` mat
-keyed on `src`'s `$basetexture` name (`holo_table_unlit_<crc>`), used
-when the bsp2 anonymous fallback for a `LightmappedGeneric` texinfo
-carries an `error` / `color/white` basetexture (typically because the
-same malformed texdata path defeated bsp2's regeneration). Without
-this, faces using a corrected `Material()` mat that's still
-`LightmappedGeneric` render black in the holo (no lightmap available).
-Cached per basetexture name across all `holo_table_3d` instances.
+**Decision:** `unlitWrap(src, translucent, alphaTest)` builds a runtime
+`UnlitGeneric` mat keyed on `src`'s `$basetexture` name plus the alpha
+mode flags (`holo_table_unlit_<crc>`). It is used when the adapter
+fallback for a `LightmappedGeneric` texinfo carries an `error` /
+`color/white` basetexture, and when the source material is translucent
+or alpha-tested and the fallback would otherwise drop those flags.
+Without this, corrected `LightmappedGeneric` materials render black in
+the holo (no lightmap available), and alpha-bearing textures such as
+glass, fences, grates, and foliage can become opaque.
 
-**Decision:** `resolveMat` for `LightmappedGeneric` faces prefers
-bsp2's per-texinfo `UnlitGeneric` fallback, but inspects its
+**Decision:** `resolveMat` for `LightmappedGeneric` faces prefers the
+adapter's per-texinfo `UnlitGeneric` fallback, but inspects its
 `$basetexture` first — if it's in the filter set, fall back to
-`unlitWrap` of the corrected `Material()` result. This combination
-recovers banner / flag / dressing faces that previously rendered as
-the error texture (and were filtered out entirely). Same logic
-applied in `GetBrushModelMeshes`.
+`unlitWrap` of the corrected `Material()` result. It also reads the
+source material flags (`MATFLAG_TRANSLUCENT`, `MATFLAG_ALPHATEST`) and
+requests a matching wrapper variant when needed. This combination
+recovers banner / flag / dressing faces that previously rendered as the
+error texture (and were filtered out entirely) and preserves common
+alpha-material behavior. Same logic applied in `GetBrushModelMeshes`.
 
 **Rejected: double-sided dressing via duplicate reversed-winding
 geometry.** Map-dressing faces (banners, flags) recovered by
@@ -501,11 +555,11 @@ real per-face "is the back face already in the BSP?" check.
 
 ## Culling
 
-**Decision:** Per-face bounding-sphere pre-cull, cached on the bsp2 face
-table itself (`face._holoCull = {cx, cy, cz, fr}`). Survives rebuilds
-within the same map load; recomputed only when bsp2 reloads. Stored as
-scalars rather than a `Vector` so the per-face hot loop can run pure
-number math.
+**Decision:** Per-face bounding-sphere pre-cull, cached on the adapted
+face table itself (`face._holoCull = {cx, cy, cz, fr}`). Survives
+rebuilds within the same map load; recomputed only when the adapter
+rebuilds those face tables. Stored as scalars rather than a `Vector` so
+the per-face hot loop can run pure number math.
 
 **Decision:** Skip the wall-clip pass when a face's bounding sphere is
 fully inside the cylinder (`horizDist + fr <= radius`); same for the
@@ -542,9 +596,10 @@ Vector allocations per build.
 exact crop.
 
 **Decision:** For static props, per-prop bounding sphere derived from
-`Entity:GetModelBounds()` of a one-shot `ClientsideModel`, cached in a
-file-level table. Sphere center is rotated into world space for
-non-axis-aligned props before the cylinder/floor test.
+`util.GetModelInfo(model).HullMin/HullMax`, cached in a file-level table.
+Sphere center is rotated into world space for non-axis-aligned props
+before the cylinder/floor test. A clientside draw entity is created only
+when the legacy fallback actually needs to draw that model.
 
 **Decision:** For baked static props and baked `prop_dynamic`, sub-pixel
 filtering is applied before building IMeshes so bakes preserve the legacy
@@ -555,15 +610,12 @@ when the watcher sees added/removed/reskinned stable entities. Moving
 
 ## Known limitations / deferred work
 
-- **Translucent / alpha-tested materials.** The build emits a single
-  opaque pass, so faces whose resolved mat is `$translucent` or
-  `$alphatest` (glass windows, fences, grates) currently render as
-  opaque black or get filtered out entirely. Needs a second
-  `ClippedMeshes`-style list collected at `resolveMat` time for
-  translucent shaders, drawn in a follow-up pass after the opaque
-  one. Probably wants per-camera depth sorting on the translucent
-  groups, or at minimum back-to-front draw order based on the
-  hologram's center-out distance.
+- **Translucent draw ordering.** Translucent / alpha-tested flags are
+  now preserved on generated `UnlitGeneric` wrappers, so the old opaque
+  black glass / grate issue is no longer the main failure mode. The
+  build still emits a single material-batched mesh list, so blended
+  surfaces may need a second `ClippedMeshes`-style list drawn after
+  opaque geometry, probably with per-camera depth sorting.
 - **3D skybox.** `sky_camera` lookup is plumbed but no skybox rendering
   is implemented. Maps without a 3D skybox (like the Venator) are
   unaffected.
@@ -588,11 +640,12 @@ when the watcher sees added/removed/reskinned stable entities. Moving
   cache-hit speed. Not implemented yet; only worth doing if the
   per-face cache + scalar math doesn't get rebuild times low enough
   for tight-fit framings to feel instant.
-- **Brush-entity flash on first frame.** The unclipped `bsp2` fallback
-  in `DrawMap` draws every face — including brush-entity faces stacked
-  at the BSP origin — for the few frames before the first clipped build
-  commits. Could be hidden by skipping non-worldspawn meshes in the
-  fallback loop.
+- **Brush-entity flash on first frame.** The unclipped adapter fallback
+  in `DrawMap` is mostly vestigial now because `bsp2.GetModelInfo()`
+  exposes no prebuilt world meshes. If that fallback grows again, make
+  sure it draws worldspawn only; brush-entity faces stacked at the BSP
+  origin would otherwise flash for the few frames before the first
+  clipped build commits.
 - **Chunked baked-prop visibility.** Static prop mode `3` intentionally
   draws whole material chunks and relies on the GPU clip prism, even in
   zoomed views. This is currently much faster than legacy or per-prop

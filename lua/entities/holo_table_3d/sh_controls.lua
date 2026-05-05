@@ -60,11 +60,12 @@ if SERVER then
 
     net.Receive('holo_table_autocenter', function(_, ply)
         local ent = net.ReadEntity()
+        local scale = math.Clamp(net.ReadFloat(), 1, 300)
+        local panX = math.Clamp(net.ReadFloat(), -16384, 16384)
+        local panY = math.Clamp(net.ReadFloat(), -16384, 16384)
+        local height = math.Clamp(net.ReadFloat(), -500, 500)
         if not IsValid(ent) or ent:GetClass() ~= 'holo_table_3d' then return end
-        local scale = net.ReadFloat()
-        local panX = net.ReadFloat()
-        local panY = net.ReadFloat()
-        local height = net.ReadFloat()
+        if IsValid(ent.Controller) and ent.Controller ~= ply then return end
         ent:SetScale(scale)
         ent:SetPanX(panX)
         ent:SetPanY(panY)
@@ -93,11 +94,11 @@ if SERVER then
     net.Receive('holo_table_setlayers', function(_, ply)
         local ent = net.ReadEntity()
         local map = net.ReadBool()
-        local ents = net.ReadBool()
+        local entities = net.ReadBool()
         if not IsValid(ent) or ent:GetClass() ~= 'holo_table_3d' then return end
         if ent.Controller ~= ply then return end
         ent:SetMap(map)
-        ent:SetEntities(ents)
+        ent:SetEntities(entities)
     end)
 
     net.Receive('holo_table_release', function(_, ply)

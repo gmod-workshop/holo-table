@@ -8,13 +8,21 @@ code looks the way it does; this file is just the working state.
 
 Garry's Mod addon (`addons/holo_table`) — a "war room" holographic table
 entity that renders a miniature 3D view of the current map at the table
-top. Map geometry is pulled from `bsp2` (required dep). Worldspawn is
-software-clipped against a 32-sided cylinder; brush entities, static
-props, radar markers, and players are GPU-clipped via a 5-sided prism +
-floor plane (the engine's 6-plane clip budget).
+top. Map geometry is pulled from NikNaks through a small compatibility
+adapter in `lua/autorun/bsp2.lua` (the old vendored parser is gone, but
+the local `bsp2.*` API name is intentionally preserved for the holo table
+code). Worldspawn is software-clipped against a 32-sided cylinder; brush
+entities, static props, radar markers, and players are GPU-clipped via a
+5-sided prism + floor plane (the engine's 6-plane clip budget).
 
 ## File layout
 
+- `lua/autorun/bsp2.lua` — NikNaks-backed BSP adapter. `require`s
+  `niknaks`, builds the small legacy surface this addon consumes
+  (`bsp2.GetCurrent`, `bsp2.GetModelInfo`, `bsp2_rebuild`, and
+  `CurrentBSPReady`), adapts NikNaks bmodels/faces/texinfo/static props
+  into the old table shape, and creates one `UnlitGeneric` fallback
+  material per texinfo for lightmap-free holo rendering.
 - `lua/entities/holo_table_3d/shared.lua` — `ENT.Type/Base`, metadata,
   `SetupDataTables` (NetworkVars: `Entities` Bool0, `Map` Bool1,
   `Height` Float0, `Scale` Float1, `PanX` Float2, `PanY` Float3).
@@ -22,9 +30,12 @@ floor plane (the engine's 6-plane clip budget).
   `SIMPLE_USE`), `ENT:Use`/`ReleaseController`/`OnRemove` ownership
   handling, `PlayerDisconnected` cleanup, net receivers for
   `holo_table_autocenter` / `holo_table_setparams` /
-  `holo_table_setlayers` / `holo_table_release` (all ownership-gated
-  and clamped to the NetworkVar limits), and `AddCSLuaFile` for every
-  client component including a loop over `radar/*.lua`.
+  `holo_table_setlayers` / `holo_table_release`, and `AddCSLuaFile` for
+  every client component including a loop over `radar/*.lua`.
+  `setparams` / `setlayers` / `release` are ownership-gated;
+  `setparams` and `autocenter` are clamped to the NetworkVar limits.
+  `autocenter` is blocked when the table is controlled by someone else,
+  while remaining usable on unowned tables.
 - `lua/entities/holo_table_3d/cl_init.lua` — slim coordinator (~375
   lines). `ENT:Initialize`/`Think`/`OnRemove` delegate to the
   per-subsystem hooks (`InitializeMap` / `InitializeRadar` / etc.).
@@ -99,7 +110,7 @@ floor plane (the engine's 6-plane clip budget).
     `BuildClippedMap` call and on Venator (5934 materials) cost
     ~230 ms — invisible in the fast-path microbench but obvious in
     real timings. Same fix applied to `GetBrushModelMeshes`.
-    Auto-invalidates when bsp2 swaps the materials list.
+    Auto-invalidates when the adapter swaps the materials list.
 12. Tracked-entity rendering ("radar system"). Originally a single
     monolithic ghost system in `cl_init.lua`; now split into
     `cl_radar.lua` (registry + `RadarBase` + ENT lifecycle hooks)
@@ -121,11 +132,12 @@ floor plane (the engine's 6-plane clip budget).
       otherwise return the error material and get filtered out,
       silently hiding banner / flag faces.
     - `unlitWrap(src)` builds a `UnlitGeneric` material around
-      `src`'s `$basetexture` for use when the bsp2 anonymous fallback
+      `src`'s `$basetexture` for use when the adapter-generated fallback
       for a texinfo carries the error texture (typically because the
-      same malformed path defeated bsp2). Cached per basetexture name.
+      same malformed path defeated the raw material lookup). Cached per
+      basetexture name.
     - `resolveMat(tinfo)` for `LightmappedGeneric` faces prefers
-      bsp2's per-texinfo `UnlitGeneric` fallback unless its
+      the adapter's per-texinfo `UnlitGeneric` fallback unless its
       `$basetexture` is in the filter set (`error` / `color/white`),
       in which case it wraps the corrected `Material()` result via
       `unlitWrap`. Same logic applied in `GetBrushModelMeshes`.
@@ -196,6 +208,8 @@ floor plane (the engine's 6-plane clip budget).
     bake active for zoomed/partial views and lets the existing GPU clip
     prism trim it. Mode `1` restores the older all-in-only bake, mode
     `2` is the per-prop baked-cull experiment, mode `0` is legacy.
+    Static prop bounds/prewarm use `util.GetModelInfo` now, so prewarm
+    no longer creates throwaway clientside entities.
 18. Targeted hot-global localization in `cl_map.lua` (`SysTime`,
     `Vector`, `Material`, `Mesh`, `bit.band`, `table.move`, selected
     `math.*`, `coroutine.*`, `hook.Add/Remove`, `render.SetMaterial`).
@@ -207,11 +221,12 @@ floor plane (the engine's 6-plane clip budget).
     `cl_map.lua` owns `prop_dynamic` as map dressing: an async baked
     IMesh path for horizontally all-in views, a 1-second watcher that
     detects added/removed/moved/reskinned props and rebuilds, and a
-    legacy per-table csent fallback for disabled bake, rebuild windows,
-    partial views, or individual moving/rotating props. Venator's
-    moving `hypertunnel.mdl` exposed why movers must be excluded from
-    the bake instead of forcing a rebuild every watcher tick. Toggle
-    with `holo_table_dynamicprop_bake`.
+    legacy per-table csent fallback for disabled bake, partial views, or
+    individual moving/rotating props. All-in bake rebuild windows
+    suppress the fallback instead of creating temporary mirror props.
+    Venator's moving `hypertunnel.mdl` exposed why movers must be
+    excluded from the bake instead of forcing a rebuild every watcher
+    tick. Toggle with `holo_table_dynamicprop_bake`.
 20. Static prop zoom bake experiments. Per-prop baked culling worked but
     was still too expensive on a zoomed Venator view because it drew
     ~1,800 visible props / ~3,400 meshes; `DrawBakedStaticProps` was
@@ -226,6 +241,34 @@ floor plane (the engine's 6-plane clip budget).
     all-in `DrawHologram` ~0.8-1.1 ms/frame, `DrawBakedStaticProps`
     ~0.17-0.25 ms, `DrawBakedDynamicProps` ~0.02-0.05 ms,
     `DrawRadar` ~0.08 ms after `prop_dynamic` removal from radar.
+22. Vendored BSP parser removed. `lua/autorun/bsp2.lua` is now a thin
+    NikNaks adapter that preserves the holo table's existing `bsp2`
+    contract instead of forcing `cl_map.lua` to learn the NikNaks API
+    directly. It adapts NikNaks bmodel 0 into `models[1]` (worldspawn),
+    bmodels `1..N` into `models[2..]`, face edges/planes/texinfo into
+    the legacy shape, static props into `{model, origin, angles, skin}`,
+    and keeps `bsp.faces` as the worldspawn fallback. `bsp2_rebuild`
+    clears/rebuilds the adapter state and re-runs `CurrentBSPReady`.
+23. Material flag preservation for translucent / alpha-tested
+    `LightmappedGeneric` sources. `resolveMat` now checks the source
+    material flags (`MATFLAG_TRANSLUCENT`, `MATFLAG_ALPHATEST`) and asks
+    `unlitWrap` to create matching `UnlitGeneric` variants, so glass,
+    grates, foliage, and similar alpha-bearing textures no longer lose
+    their transparency just because the holo pass has no lightmaps.
+    There is still no dedicated sorted translucent pass.
+24. Console `KeyValues Error ... mdlkeyvalue` spam on map load /
+    auto-refresh was traced to malformed embedded model KeyValues in
+    third-party models such as `models/cires992/props2/shelf02_l.mdl`.
+    `ClientsideModel` / `ents.CreateClientProp` makes the engine parse
+    those bad blocks; `util.GetModelMeshes` and `util.GetModelInfo` do
+    not spam by themselves. The current mitigation avoids clientside
+    entity creation during static-prop prewarm and suppresses the
+    all-in `prop_dynamic` fallback while the bake is building.
+25. Hot-reload cleanup. `cl_map.lua` registers
+    `_G.HOLO_TABLE_3D_CL_MAP_CLEANUP` and runs the previous generation's
+    cleanup at file load. This tears down shared static/dynamic prop
+    bakes, brush mesh caches, prewarm hooks, and cached clientside draw
+    entities so Lua auto-refresh does not strand IMesh/csent resources.
 
 ## Profiling baselines
 
@@ -290,14 +333,13 @@ visible table, scale 270):
 
 Current likely next work:
 
-1. **Translucent / alpha-tested materials.** Glass windows, fences,
-   grates and similar `$translucent` / `$alphatest` faces currently
-   render as opaque black (or are filtered out entirely) because the
-   build emits everything in one opaque pass. Needs a second pass that
-   collects translucent-shader mats into their own group list, draws
-   them after the opaque pass, and probably depth-sorts per camera.
-   Likely requires `$translucent` detection on the resolved mat at
-   `resolveMat` time and a parallel `ClippedMeshesTrans` list.
+1. **Translucent draw ordering.** Alpha-tested / translucent material
+   flags are now preserved on the generated `UnlitGeneric` wrappers, so
+   the old "opaque black glass" failure mode is mostly gone. The build
+   still emits a single material-batched mesh list, though; a future
+   pass may need a separate translucent group list drawn after opaque
+   geometry, probably with camera-relative sorting, if blended surfaces
+   show order artifacts.
 2. **Brush entity cost.** With static props and `prop_dynamic` baked,
    `DrawBrushEntities` is often the next meaningful per-frame cost on
    Venator-like maps. Potential work: separate static `func_brush` /
@@ -316,9 +358,10 @@ Current likely next work:
 
 ## Pinned facts (don't relitigate)
 
-- `bsp2` is a required dependency (worldspawn faces, brush models,
-  static props, materials all come from it). Without it the entity
-  draws nothing.
+- NikNaks is the required BSP parser dependency. The addon keeps a local
+  `bsp2` compatibility adapter so the map subsystem can keep using the
+  old `bsp2.GetCurrent()` / `bsp2.GetModelInfo()` surface; without
+  NikNaks (or if `require('niknaks')` fails) the entity draws no map.
 - Clipping volume is a 32-sided cylinder, radius `scale * 90`. The 5
   GPU clip planes form an outward-circumscribing pentagonal prism; the
   cylinder pokes through the prism corners which is fine because the
@@ -338,18 +381,18 @@ Current likely next work:
   precomputed `tableOrigin + R * (p / scale)` transform; baked static
   props and baked `prop_dynamic` dressing are IMeshes in BSP space and
   draw inside the `m2` holo matrix.
-- bsp2 emits one unique `UnlitGeneric` material per texinfo. Group draws
-  by `$basetexture` name (fallback: material name) to collapse those
-  back into one batch per texture.
-- `_holoCull` / `_holoTris` live on the bsp2 face tables themselves and
-  survive across rebuilds within a map load; a `CurrentBSPReady` hook
-  clears the brush mesh cache (face-level caches die naturally with the
-  bsp2 face tables they sit on).
+- The NikNaks adapter emits one unique `UnlitGeneric` material per
+  texinfo. Group draws by `$basetexture` name (fallback: material name)
+  to collapse those back into one batch per texture.
+- `_holoCull` / `_holoTris` live on the adapted face tables themselves
+  and survive across rebuilds within a map load; a `CurrentBSPReady`
+  hook clears the brush mesh cache.
 - `matByTexinfo` is cached at file scope (`getMatByTexinfo`) keyed by
   `mi.materials` table identity. **Do not rebuild this per call** —
   on big maps the rebuild is ~230 ms and dominates the clip phase
   if reintroduced. Used by both `BuildClippedMap` and
-  `GetBrushModelMeshes`.
+  `GetBrushModelMeshes`. The material list comes from the NikNaks
+  adapter's `bsp2.GetModelInfo()`.
 - Re-`include`-ing `cl_init.lua` (or any of `cl_map.lua` / `cl_radar.lua`
   / `sh_controls.lua`) from a runstring does **not** update already-
   spawned entity instances. `scripted_ents.GetStored(...).t` has the
@@ -379,8 +422,10 @@ Current likely next work:
   same as in the live world from outside.
 - Server is the source of truth for control ownership. Client
   optimistically writes to NetworkVars on input so the table reacts
-  the same frame; the server's snapshot replays the (clamped /
-  ownership-checked) authoritative value within ~RTT. Don't add a
+  the same frame; the server's snapshot replays the clamped /
+  ownership-checked authoritative value within ~RTT. `autocenter`
+  accepts client-computed fit params, but clamps them and rejects
+  attempts to change a table controlled by another player. Don't add a
   client-side action that needs to *persist* without a corresponding
   net send — the server snapshot will overwrite it.
 - All four client sub-files (`sh_controls.lua`, `cl_map.lua`,
@@ -452,9 +497,9 @@ command like `echo` first if unsure):
   command (`holo_table_profile`, `holo_table_autocenter`, `lua_run …`,
   etc.) and capture output for `timeout` seconds.
 - `execute_lua_code_Garry_s_Mod(code, timeout)` — runs Lua
-  **client-side** via a temp file. Good for inspecting `bsp2` shapes,
-  per-face cache state, NetworkVar values, or anything that needs
-  more than a one-liner. Use `lua_run` via the command tool when
+  **client-side** via a temp file. Good for inspecting NikNaks adapter
+  shapes, per-face cache state, NetworkVar values, or anything that
+  needs more than a one-liner. Use `lua_run` via the command tool when
   server-side execution is needed.
 - `capture_console_output_Garry_s_Mod(duration)` — passive listener;
   useful for monitoring multi-frame async events (coroutine build

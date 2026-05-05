@@ -7,6 +7,13 @@
 -- per-frame hologram transform from self._holo* (staged by
 -- ENT:UpdateHologramTransform in cl_init.lua), so they take no params.
 
+local previousCleanup = _G.HOLO_TABLE_3D_CL_MAP_CLEANUP
+if type(previousCleanup) == 'function' then
+    local ok, err = pcall(previousCleanup)
+    if not ok then ErrorNoHaltWithStack(err) end
+end
+_G.HOLO_TABLE_3D_CL_MAP_CLEANUP = nil
+
 -- Forward declaration: the prewarm driver (defined further down once
 -- its dependencies -- resolveMat, resolveProj, getMatByTexinfo, the
 -- cull/tri builders -- are in scope) is invoked from InitializeMap.
@@ -126,10 +133,10 @@ local filter = {
     ['error'] = true
 }
 
--- Per-model bounding-sphere {center, radius} in model-local space, plus a
--- reusable ClientsideModel for cheap render.Model calls. Shared across all
--- holo_table_3d entities; entries are populated lazily on first use and
--- live for the rest of the session.
+-- Per-model bounding-sphere {center, radius} in model-local space, plus
+-- reusable ClientsideModel draw entities for the legacy fallback path.
+-- Shared across all holo_table_3d entities; entries are populated lazily
+-- on first use and live until hot-reload cleanup.
 local propBoundsCache = {}
 local propEntCache = {}
 
@@ -150,20 +157,49 @@ local PROP_SUBPIXEL_THRESHOLD = 0.5
 local function getPropBounds(name)
     local b = propBoundsCache[name]
     if b then return b end
-    local cs = ClientsideModel(name)
-    if IsValid(cs) then
-        local mins, maxs = cs:GetModelBounds()
+    local info = util.GetModelInfo(name)
+    if info and info.HullMin and info.HullMax then
+        local mins, maxs = info.HullMin, info.HullMax
         b = {
             center = (mins + maxs) * 0.5,
             radius = (maxs - mins):Length() * 0.5,
         }
-        cs:SetNoDraw(true)
-        propEntCache[name] = cs
     else
-        b = { center = vector_origin, radius = 0 }
+        local cs = ClientsideModel(name)
+        if IsValid(cs) then
+            local mins, maxs = cs:GetModelBounds()
+            b = {
+                center = (mins + maxs) * 0.5,
+                radius = (maxs - mins):Length() * 0.5,
+            }
+            cs:SetNoDraw(true)
+            propEntCache[name] = cs
+        else
+            b = { center = vector_origin, radius = 0 }
+        end
     end
     propBoundsCache[name] = b
     return b
+end
+
+local function getPropDrawEnt(name)
+    local cs = propEntCache[name]
+    if IsValid(cs) then return cs end
+    cs = ClientsideModel(name)
+    if IsValid(cs) then
+        cs:SetNoDraw(true)
+        propEntCache[name] = cs
+        return cs
+    end
+    return nil
+end
+
+local function cleanupPropEntCache()
+    for model, cs in pairs(propEntCache) do
+        if IsValid(cs) then SafeRemoveEntity(cs) end
+        propEntCache[model] = nil
+    end
+    propBoundsCache = {}
 end
 
 -- Sutherland–Hodgman clip of a convex polygon against the half-space
@@ -247,12 +283,10 @@ local MATFLAG_ALPHATEST   = 0x100
 local MATFLAG_TRANSLUCENT = 0x200000
 
 -- Wraps `src`'s $basetexture in a runtime UnlitGeneric so the holo pass can
--- render it without a lightmap. Used when the bsp2 anonymous fallback for a
--- given texinfo carries the error texture (typically because the BSP texdata
--- path was malformed and bsp2 couldn't normalize it the way Material() does
--- after loadTexdataMaterial strips the leading slash), and to rebuild a
--- translucent/alphatest variant when the source had those flags set (bsp2's
--- generated UnlitGeneric drops them).
+-- render it without a lightmap. Used when the adapter-generated fallback for
+-- a given texinfo carries the error texture (typically because the BSP
+-- texdata path was malformed), and to rebuild a translucent/alphatest
+-- variant when the generated UnlitGeneric drops those flags.
 local unlitWrapCache = {}
 local function unlitWrap(src, translucent, alphaTest)
     local btn = src:GetTexture('$basetexture')
@@ -344,13 +378,14 @@ local function resolveProj(tinfo)
     return p
 end
 
--- bsp2 emits one UnlitGeneric material per texinfo (named `<tinfo>_texinfo`)
--- and exposes them via mi.materials. We need a name->material lookup to fall
--- back from LightmappedGeneric world materials. Building that lookup is
+-- The NikNaks adapter emits one UnlitGeneric material per texinfo (named
+-- `<tinfo>_texinfo`) and exposes them via mi.materials. We need a
+-- name->material lookup to fall back from LightmappedGeneric world
+-- materials. Building that lookup is
 -- O(materials) and on big maps (rp_venator: 5934 entries) costs ~250 ms --
 -- entirely in :GetName() calls into engine code, so we can't avoid the work,
 -- only chunk it. Cache is keyed by the mi.materials table identity so
--- rebuilds only happen when bsp2 swaps the list (i.e. on map load).
+-- rebuilds only happen when the adapter swaps the list.
 --
 -- When called from a coroutine context (the user-visible build path or
 -- the prewarm), the build is yieldable: pass `deadlineFn`/`bumpFn` and
@@ -431,7 +466,7 @@ function startTriCachePrewarm()
         local function bumpDeadline() deadlineCell[1] = SysTime() + PREWARM_BUDGET_IDLE end
 
         -- Phase 0: build the texinfo->material lookup. Unavoidable
-        -- :GetName() call for every entry in bsp2's material list, so
+        -- :GetName() call for every entry in the adapter material list, so
         -- on big maps this is ~250 ms of work and would show up as a
         -- single hitch if BuildClippedMap had to do it on the user's
         -- first cold build. The yieldable variant spreads it over
@@ -551,8 +586,8 @@ function startTriCachePrewarm()
 end
 
 -- Touches every unique static-prop model on the map exactly once via
--- getPropBounds, which creates a ClientsideModel and forces the engine
--- to load the model + its materials. Without this, those loads happen
+-- getPropBounds, which forces the engine to load model metadata without
+-- creating a throwaway clientside entity. Without this, those loads happen
 -- lazily inside DrawStaticProps and produce 80-90 ms hitches the first
 -- time the table renders a previously-unseen prop. Cheap enough (~110
 -- unique models on a dense map at sub-millisecond per touch) that we
@@ -603,10 +638,10 @@ function startPropPrewarm()
     end)
 end
 
--- Shared all-in static-prop bake. Static BSP props never move, so their
--- model triangles can be transformed into BSP space once and drawn under
--- the same holo scene matrix as the world mesh. V1 only uses this for
--- all-in framings; tight partial views keep the old per-prop culling path.
+-- Shared static-prop bake. Static BSP props never move, so their model
+-- triangles can be transformed into BSP space once and drawn under the
+-- same holo scene matrix as the world mesh. Mode 3 keeps this global bake
+-- active for zoomed views and lets the GPU clip prism trim it.
 local STATIC_PROP_BAKE_HOOK = 'holo_table_3d.static_prop_bake'
 local STATIC_PROP_PER_PROP_BAKE_HOOK = 'holo_table_3d.static_prop_per_prop_bake'
 local STATIC_PROP_BAKE_FRAME_BUDGET = 0.006
@@ -1029,7 +1064,7 @@ local DYNAMIC_PROP_BAKE_HOOK = 'holo_table_3d.dynamic_prop_bake'
 local DYNAMIC_PROP_SCAN_INTERVAL = 1.0
 local dynamicPropBake = nil
 
-function destroyMeshList(list)
+destroyMeshList = function(list)
     if not list then return end
     for _, item in ipairs(list) do
         if item.mesh then
@@ -1298,9 +1333,9 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     local matByTexinfoBumpFn     = useYield and bumpBuildDeadline or nil
     if useYield then bumpBuildDeadline() end
 
-    -- bsp2 builds one UnlitGeneric material per unique texinfo. Used as a
-    -- fallback for LightmappedGeneric world materials, which render black
-    -- without a lightmap. Cached across builds (see getMatByTexinfo).
+    -- The adapter builds one UnlitGeneric material per unique texinfo.
+    -- Used as a fallback for LightmappedGeneric world materials, which
+    -- render black without a lightmap. Cached across builds.
     local matByTexinfo = getMatByTexinfo(matByTexinfoDeadlineFn, matByTexinfoBumpFn) or {}
 
     local axis = self:GetUp()
@@ -1383,8 +1418,9 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
         sFacesTotal = sFacesTotal + 1
 
 
-        -- Per-face bounding sphere, cached on the bsp2 face table itself.
-        -- Survives subsequent rebuilds; recomputed only when bsp2 reloads.
+        -- Per-face bounding sphere, cached on the adapted face table itself.
+        -- Survives subsequent rebuilds; recomputed only when the adapter
+        -- rebuilds the face tables.
         -- Stored as scalars (cx/cy/cz/fr) so the per-face cull math below
         -- can run without ever materialising a Vector.
         local cull = face._holoCull
@@ -1535,10 +1571,9 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
 
 
         if #poly >= 3 then
-            -- Group by basetexture so the per-texinfo bsp2 materials (which
-            -- otherwise have unique names) collapse into one batch per
-            -- texture. Falls back to material name when there is no
-            -- basetexture.
+            -- Group by basetexture so the per-texinfo adapter materials
+            -- collapse into one batch per texture. Falls back to material
+            -- name when there is no basetexture.
             local btn = mat:GetTexture('$basetexture')
             local matKey = btn and btn:GetName() or mat:GetName()
             local group = groups[matKey]
@@ -1785,7 +1820,7 @@ end
 -- Per-bmodel mesh cache. Brush-entity faces in the BSP are stored relative
 -- to the entity's local origin, so the cached IMesh sits in local space
 -- and DrawBrushEntities transforms it by the live entity's pos/ang. Shared
--- across holo_table_3d instances; cleared on map load via the bsp2 hook.
+-- across holo_table_3d instances; cleared on map load via the adapter hook.
 local brushMeshCache = {}
 
 local function clearBrushMeshCache()
@@ -1831,9 +1866,9 @@ function ENT:GetBrushModelMeshes(modelIndex)
 
         local mat = loadTexdataMaterial(tinfo.texdata.material)
         if mat:GetShader() == 'LightmappedGeneric' then
-            -- See BuildClippedMap.resolveMat: prefer bsp2's UnlitGeneric
-            -- fallback, but wrap the corrected texture ourselves when the
-            -- fallback is broken.
+            -- See BuildClippedMap.resolveMat: prefer the adapter fallback,
+            -- but wrap the corrected texture ourselves when that fallback
+            -- is broken.
             local fb = matByTexinfo[tostring(tinfo) .. '_texinfo']
             if fb then
                 local fbBtn = fb:GetTexture('$basetexture')
@@ -2086,9 +2121,9 @@ function ENT:DrawBakedDynamicProps()
     end
     if not dynamicPropBake or dynamicPropBake.gen ~= CACHE_GENERATION then
         startDynamicPropBakeWatch()
-        return false
+        return true
     end
-    if dynamicPropBake.state ~= 'ready' or not dynamicPropBake.meshes then return false end
+    if dynamicPropBake.state ~= 'ready' or not dynamicPropBake.meshes then return true end
 
     render.SuppressEngineLighting(true)
     local ok, err = pcall(function()
@@ -2337,7 +2372,7 @@ function ENT:DrawStaticProps()
         if hx * hx + hy * hy + hz * hz > bound * bound then continue end
         if along + radius < floorOffset then continue end
 
-        local cs = propEntCache[model]
+        local cs = getPropDrawEnt(model)
         if not IsValid(cs) then continue end
 
         -- Draw transform, written entirely into scratch storage.
@@ -2481,11 +2516,11 @@ end
 
 function ENT:DrawMap()
     local map = bsp2.GetModelInfo()
+    if not map then return end
 
-    if not map then self:DrawModel() return end
-
-    -- When ClippedMeshes exists, DrawHologram has already drawn the map
-    -- outside the stencil/clip pipeline, so skip it here.
+    -- Legacy adapter fallback. The NikNaks adapter currently exposes no
+    -- prebuilt meshes/entities here; the real map paths are DrawClippedMap,
+    -- DrawBrushEntities, and the prop bakes.
     if self:GetMap() and not self.ClippedMeshes then
         for k, v in ipairs(map.meshes) do
             local mat = map.materials[k]
@@ -2500,6 +2535,22 @@ function ENT:DrawMap()
             v:DrawModel()
         end
     end
+end
+
+_G.HOLO_TABLE_3D_CL_MAP_CLEANUP = function()
+    hook_Remove('Think', prewarmHookName)
+    prewarmCo = nil
+    prewarmGen = nil
+
+    hook_Remove('Think', propPrewarmHookName)
+    propPrewarmCo = nil
+    propPrewarmGen = nil
+
+    destroyStaticPropBake()
+    destroyStaticPropPerPropBake()
+    destroyDynamicPropBake()
+    clearBrushMeshCache()
+    cleanupPropEntCache()
 end
 
 
