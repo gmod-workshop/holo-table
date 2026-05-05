@@ -6,4 +6,7 @@ A proof of concept holo table for displaying entity positions and other informat
 
 Clone this repository into a folder in your addons folder.
 
-This addon requires the [Venator Model Pack](https://steamcommunity.com/sharedfiles/filedetails/?id=1251088550) by King Pommes
+## Dependencies
+
+- [Venator Model Pack](https://steamcommunity.com/sharedfiles/filedetails/?id=1251088550) by King Pommes
+- [NikNaks](https://github.com/Nak2/NikNaks) by Nak

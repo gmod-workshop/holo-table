@@ -95,7 +95,6 @@ local STENCIL_MASK_MTX  = Matrix()
 local SCENE_MTX         = Matrix()
 local SCENE_SCALE_VEC   = Vector()
 local STENCIL_VERT_VEC  = Vector()
-local STENCIL_PLANE_VEC = Vector()
 local STENCIL_NORMAL_VEC = Vector()
 local STENCIL_SEGMENTS  = 32
 local STENCIL_RADIUS    = 90

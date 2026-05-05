@@ -60,19 +60,19 @@ function RadarBase:Project(pos, ang)
     local sp, cp = sin(ang.p * DEG2RAD), cos(ang.p * DEG2RAD)
     local sy, cy = sin(ang.y * DEG2RAD), cos(ang.y * DEG2RAD)
     local sr, cr = sin(ang.r * DEG2RAD), cos(ang.r * DEG2RAD)
-    local pFx, pFy, pFz =  cp*cy,             cp*sy,             -sp
-    local pRx, pRy, pRz = -sr*sp*cy + cr*sy, -sr*sp*sy - cr*cy, -sr*cp
-    local pUx, pUy, pUz =  cr*sp*cy + sr*sy,  cr*sp*sy - sr*cy,  cr*cp
+    local pFx, pFy, pFz =  cp * cy,             cp * sy,             -sp
+    local pRx, pRy, pRz = -sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp
+    local pUx, pUy, pUz =  cr * sp * cy + sr * sy,  cr * sp * sy - sr * cy,  cr * cp
 
     -- Compose with the table basis (only the components needed for
     -- Euler extraction: full F, plus R.z and U.z).
-    local wFx = tFx*pFx - tRx*pFy + tUx*pFz
-    local wFy = tFy*pFx - tRy*pFy + tUy*pFz
-    local wFz = tFz*pFx - tRz*pFy + tUz*pFz
-    local wRz = tFz*pRx - tRz*pRy + tUz*pRz
-    local wUz = tFz*pUx - tRz*pUy + tUz*pUz
+    local wFx = tFx * pFx - tRx * pFy + tUx * pFz
+    local wFy = tFy * pFx - tRy * pFy + tUy * pFz
+    local wFz = tFz * pFx - tRz * pFy + tUz * pFz
+    local wRz = tFz * pRx - tRz * pRy + tUz * pRz
+    local wUz = tFz * pUx - tRz * pUy + tUz * pUz
     PROJ_ANG:SetUnpacked(
-        atan2(-wFz, sqrt(wFx*wFx + wFy*wFy)) * RAD2DEG,
+        atan2(-wFz, sqrt(wFx * wFx + wFy * wFy)) * RAD2DEG,
         atan2(wFy, wFx) * RAD2DEG,
         atan2(-wRz, wUz) * RAD2DEG)
     return PROJ_POS, PROJ_ANG

@@ -7,7 +7,7 @@ AddCSLuaFile('cl_map.lua')
 -- Drop a .lua into entities/holo_table_3d/radar/ and the client picks
 -- it up via cl_radar.lua's loader; this loop just makes sure each one
 -- ships to clients.
-for _, f in ipairs((file.Find('entities/holo_table_3d/radar/*.lua', 'LUA'))) do
+for _, f in ipairs(file.Find('entities/holo_table_3d/radar/*.lua', 'LUA')) do
     AddCSLuaFile('radar/' .. f)
 end
 
