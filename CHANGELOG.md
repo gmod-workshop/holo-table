@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Split the client map subsystem into ordered `map/cl_map_*.lua`
+  fragments with shared internals on `ENT._Map`.
+- Added clientside LVS tracer projection on the holo display.
+
+### Documented
+
+- Current map subsystem layout, spawn-time split fixes, and steady-state
+  Lua allocation estimates.
+
 ## [0.1.0]
 
 ### Added

@@ -3,14 +3,21 @@ include('sh_controls.lua')
 include('cl_map.lua')
 include('cl_radar.lua')
 
+local HOLOGRAM_HOOK = 'holo_table_3d.DrawHologram'
+local hologramHookInstalled = false
+local ensureHologramHook
+local pruneHologramHook
+
 function ENT:Initialize()
     local meshes = util.GetModelMeshes('models/props_phx/construct/metal_plate_curve360x2.mdl')
 
-    self.Mask = Mesh()
-    self.Mask:BuildFromTriangles(meshes[1].triangles)
+    local selfTbl = self:GetTable()
+    selfTbl.Mask = Mesh()
+    selfTbl.Mask:BuildFromTriangles(meshes[1].triangles)
 
     self:InitializeMap()
     self:InitializeRadar()
+    if ensureHologramHook then ensureHologramHook() end
 end
 
 -- Radar polling rate. Default Think runs at framerate (~240 Hz on
@@ -31,6 +38,7 @@ end
 function ENT:OnRemove()
     self:CleanupMap()
     self:CleanupRadar()
+    if pruneHologramHook then pruneHologramHook() end
 end
 
 
@@ -42,6 +50,7 @@ end
 -- at the top of DrawHologram; consumers read self._holo* instead of
 -- recomputing the same pivot / pan math.
 function ENT:UpdateHologramTransform(scale, height, panX, panY)
+    local selfTbl = self:GetTable()
     local pos = self:GetPos()
     local axis = self:GetUp()
     local pivotZ = pos:Dot(axis)
@@ -52,13 +61,13 @@ function ENT:UpdateHologramTransform(scale, height, panX, panY)
     local tableAng = self:GetAngles()
     local rotPan = LocalToWorld(panOffset, angle_zero, vector_origin, tableAng)
 
-    self._holoAxis        = axis
-    self._holoAngles      = tableAng
-    self._holoInvScale    = invScale
-    self._holoCylRadius   = scale * 90
-    self._holoFloorOffset = scale * (25 - height) + pivotZ
-    self._holoPanHoriz    = panHoriz
-    self._holoOrigin      = pos + axis * (height - pivotZ / scale) - rotPan * invScale
+    selfTbl._holoAxis        = axis
+    selfTbl._holoAngles      = tableAng
+    selfTbl._holoInvScale    = invScale
+    selfTbl._holoCylRadius   = scale * 90
+    selfTbl._holoFloorOffset = scale * (25 - height) + pivotZ
+    selfTbl._holoPanHoriz    = panHoriz
+    selfTbl._holoOrigin      = pos + axis * (height - pivotZ / scale) - rotPan * invScale
 
     -- Scalar caches of the table-space basis and origin, used by
     -- RadarBase:Project for allocation-free LocalToWorld in the per-
@@ -68,11 +77,11 @@ function ENT:UpdateHologramTransform(scale, height, panX, panY)
     local F = tableAng:Forward()
     local R = tableAng:Right()
     local U = tableAng:Up()
-    self._holoFx, self._holoFy, self._holoFz = F.x, F.y, F.z
-    self._holoRx, self._holoRy, self._holoRz = R.x, R.y, R.z
-    self._holoUx, self._holoUy, self._holoUz = U.x, U.y, U.z
-    local o = self._holoOrigin
-    self._holoOx, self._holoOy, self._holoOz = o.x, o.y, o.z
+    selfTbl._holoFx, selfTbl._holoFy, selfTbl._holoFz = F.x, F.y, F.z
+    selfTbl._holoRx, selfTbl._holoRy, selfTbl._holoRz = R.x, R.y, R.z
+    selfTbl._holoUx, selfTbl._holoUy, selfTbl._holoUz = U.x, U.y, U.z
+    local o = selfTbl._holoOrigin
+    selfTbl._holoOx, selfTbl._holoOy, selfTbl._holoOz = o.x, o.y, o.z
 end
 
 
@@ -108,7 +117,8 @@ local STENCIL_PRISM_WALL_COUNT = 5
 -- global render hook so the OPAQUE pass that drives halo.Render sees
 -- only the table model.
 function ENT:DrawHologram()
-    if not self.Mask then return end
+    local selfTbl = self:GetTable()
+    if not selfTbl.Mask then return end
 
     self:UpdateHologramTransform(self:GetScale(), self:GetHeight(),
         self:GetPanX(), self:GetPanY())
@@ -191,7 +201,7 @@ function ENT:DrawHologram()
     maskMtx:Scale(SCENE_SCALE_VEC)
 
     cam.PushModelMatrix(maskMtx)
-        self.Mask:Draw()
+        selfTbl.Mask:Draw()
     cam.PopModelMatrix()
 
     render.OverrideDepthEnable(false, false)
@@ -241,9 +251,9 @@ function ENT:DrawHologram()
     -- so BSP (panX, panY) lands at the table center.
     local m2 = SCENE_MTX
     m2:Identity()
-    m2:SetTranslation(self._holoOrigin)
-    m2:SetAngles(self._holoAngles)
-    SCENE_SCALE_VEC:SetUnpacked(self._holoInvScale, self._holoInvScale, self._holoInvScale)
+    m2:SetTranslation(selfTbl._holoOrigin)
+    m2:SetAngles(selfTbl._holoAngles)
+    SCENE_SCALE_VEC:SetUnpacked(selfTbl._holoInvScale, selfTbl._holoInvScale, selfTbl._holoInvScale)
     m2:Scale(SCENE_SCALE_VEC)
 
     render.PushFilterMag(TEXFILTER.ANISOTROPIC)
@@ -314,18 +324,24 @@ local CULL_SPHERE_RADIUS = 120
 -- engine-side jitter; cheap insurance against false culls at edges.
 local CULL_FOV_PADDING_DEG = 8
 
--- Drives ENT:DrawHologram for every holo_table_3d in PVS from the
--- translucent render hook. The OPAQUE entity pass has to stay free of
--- stencil/clip work for halo.Render's silhouette pass to come out
--- correct, so the holographic content rides this hook instead.
+-- Drives ENT:DrawHologram from the translucent render hook. The hook is
+-- installed only while at least one holo_table_3d exists, so maps with
+-- no table do not pay a per-frame entity scan.
 --
 -- Cull tables outside the view frustum here: DrawHologram costs ~2.1ms
 -- per call regardless of whether anything is visible, and PVS is
 -- generous enough that the table is often in PVS but behind the camera
 -- or off to the side. Cone-vs-bounding-sphere is the cheapest test
 -- that handles both the behind-camera and off-screen cases at once.
-hook.Add('PostDrawTranslucentRenderables', 'holo_table_3d.DrawHologram', function(bDepth, bSkybox, b3DSkybox)
+local function drawHolograms(bDepth, bSkybox, b3DSkybox)
     if bDepth or bSkybox or b3DSkybox then return end
+
+    local tables = ents.FindByClass('holo_table_3d')
+    if not tables[1] then
+        hook.Remove('PostDrawTranslucentRenderables', HOLOGRAM_HOOK)
+        hologramHookInstalled = false
+        return
+    end
 
     -- Skip when rendering into a render target (point_camera /
     -- func_camera_screen / cockpit viewscreens / scope RTs). The
@@ -345,30 +361,51 @@ hook.Add('PostDrawTranslucentRenderables', 'holo_table_3d.DrawHologram', functio
     local sphereR = CULL_SPHERE_RADIUS
     local negSphereR = -sphereR
 
-    -- ents.Iterator returns a cached entity table (no per-frame alloc),
-    -- vs ents.FindByClass which builds a fresh filtered table each call.
-    -- Class filter via GetClass is cheap enough that the saved alloc wins.
-    for _, ent in ents.Iterator() do
-        if ent:GetClass() == 'holo_table_3d' and ent.DrawHologram then
-            local p = ent:GetPos()
-            local dx, dy, dz = p.x - exV, p.y - eyV, p.z - ezV
-            local fwd = dx * fxV + dy * fyV + dz * fzV
-            -- Behind-camera reject: entire bounding sphere lies behind
-            -- the eye plane.
-            if fwd >= negSphereR then
-                -- Cone reject: lateral distance from the view axis
-                -- exceeds the cone half-width at this depth, padded by
-                -- the bounding sphere radius. Uses max(fwd, 0) so very
-                -- close tables (slightly behind plane but sphere still
-                -- straddling the eye) get the full sphere padding.
-                local sqrLen = dx * dx + dy * dy + dz * dz
-                local lateralSq = sqrLen - fwd * fwd
-                local coneFwd = fwd > 0 and fwd or 0
-                local maxLat = coneFwd * tanHalfFov + sphereR
-                if lateralSq <= maxLat * maxLat then
-                    ent:DrawHologram()
-                end
+    for _, ent in ipairs(tables) do
+        if not ent.DrawHologram then continue end
+
+        local p = ent:GetPos()
+        local dx, dy, dz = p.x - exV, p.y - eyV, p.z - ezV
+        local fwd = dx * fxV + dy * fyV + dz * fzV
+        -- Behind-camera reject: entire bounding sphere lies behind
+        -- the eye plane.
+        if fwd >= negSphereR then
+            -- Cone reject: lateral distance from the view axis exceeds
+            -- the cone half-width at this depth, padded by the bounding
+            -- sphere radius. Uses max(fwd, 0) so very close tables
+            -- (slightly behind plane but sphere still straddling the
+            -- eye) get the full sphere padding.
+            local sqrLen = dx * dx + dy * dy + dz * dz
+            local lateralSq = sqrLen - fwd * fwd
+            local coneFwd = fwd > 0 and fwd or 0
+            local maxLat = coneFwd * tanHalfFov + sphereR
+            if lateralSq <= maxLat * maxLat then
+                ent:DrawHologram()
             end
         end
     end
-end)
+end
+
+ensureHologramHook = function()
+    if hologramHookInstalled then return end
+    if not ents.FindByClass('holo_table_3d')[1] then return end
+
+    hook.Add('PostDrawTranslucentRenderables', HOLOGRAM_HOOK, drawHolograms)
+    hologramHookInstalled = true
+end
+
+pruneHologramHook = function()
+    timer.Simple(0, function()
+        if ents.FindByClass('holo_table_3d')[1] then return end
+
+        hook.Remove('PostDrawTranslucentRenderables', HOLOGRAM_HOOK)
+        hologramHookInstalled = false
+    end)
+end
+
+if ents.FindByClass('holo_table_3d')[1] then
+    ensureHologramHook()
+else
+    hook.Remove('PostDrawTranslucentRenderables', HOLOGRAM_HOOK)
+    hologramHookInstalled = false
+end

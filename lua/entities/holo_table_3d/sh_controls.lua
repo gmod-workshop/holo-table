@@ -7,6 +7,7 @@
 
 if SERVER then
     util.AddNetworkString('holo_table_autocenter')
+    util.AddNetworkString('holo_table_focus_table')
     util.AddNetworkString('holo_table_control')
     util.AddNetworkString('holo_table_setparams')
     util.AddNetworkString('holo_table_setlayers')
@@ -58,7 +59,7 @@ if SERVER then
         end
     end
 
-    net.Receive('holo_table_autocenter', function(_, ply)
+    local function receiveSnapParams(_, ply)
         local ent = net.ReadEntity()
         local scale = math.Clamp(net.ReadFloat(), 1, 300)
         local panX = math.Clamp(net.ReadFloat(), -16384, 16384)
@@ -70,7 +71,10 @@ if SERVER then
         ent:SetPanX(panX)
         ent:SetPanY(panY)
         ent:SetHeight(height)
-    end)
+    end
+
+    net.Receive('holo_table_autocenter', receiveSnapParams)
+    net.Receive('holo_table_focus_table', receiveSnapParams)
 
     -- Live parameter feed from the active controller. Clamped to the
     -- NetworkVar limits in shared.lua so a malicious client can't push
@@ -121,7 +125,8 @@ end
 -- Client: input polling, HUD, control concommands. Player presses +use
 -- on a table to grab control; while controlling, +forward/+back/
 -- +moveleft/+moveright pan, mouse wheel adjusts height, +speed+wheel
--- adjusts scale, +reload re-centers. Movement keys are read off the
+-- adjusts scale, +reload re-centers, and +speed+reload focuses the
+-- table's own map position. Movement keys are read off the
 -- cmd's button bits (cmd:KeyDown) so user keybinds are respected.
 -- NetworkVar writes are optimistic on the client (snappy) and
 -- re-confirmed by the server's next snapshot.
@@ -132,6 +137,8 @@ local HEIGHT_STEP      = 10   -- world units per scroll tick (scale-invariant)
 local SCALE_FACTOR     = 1.10 -- multiplicative per shift+scroll tick
 local PRECISION_MUL    = 0.25 -- pan/height/zoom step multiplier while +duck held
 local SEND_INTERVAL    = 0.033
+local TABLE_FOCUS_SCALE = 8    -- nearby players read clearly without shrinking the whole map into view
+local TABLE_FOCUS_HEIGHT = 28  -- slightly lifts the focused slice so the table-room floor stays visible
 
 -- Mirrors the NetworkVar limits in shared.lua.
 local SCALE_MIN, SCALE_MAX   = 1, 300
@@ -223,6 +230,26 @@ local function findControlTarget()
     return best
 end
 
+-- Applies a precomputed scale/pan/height snap locally and ships the
+-- same values to the server. Server replays the clamped authoritative
+-- values within ~RTT.
+--- @param ent Entity
+local function sendSnapParams(ent, netName, scale, panX, panY, height)
+    ent:SetScale(scale)
+    ent:SetPanX(panX)
+    ent:SetPanY(panY)
+    ent:SetHeight(height)
+
+    net.Start(netName)
+    net.WriteEntity(ent)
+    net.WriteFloat(scale)
+    net.WriteFloat(panX)
+    net.WriteFloat(panY)
+    net.WriteFloat(height)
+    net.SendToServer()
+    return true
+end
+
 -- Computes auto-center params for `ent` and ships them to the server.
 -- Optimistic local write so the table snaps the same frame; server
 -- replays with the (clamped) authoritative values within ~RTT. Returns
@@ -233,19 +260,18 @@ local function sendAutoCenter(ent)
     local scale, panX, panY, height = ent:ComputeAutoCenter()
     if not scale then return false end
 
-    ent:SetScale(scale)
-    ent:SetPanX(panX)
-    ent:SetPanY(panY)
-    ent:SetHeight(height)
+    return sendSnapParams(ent, 'holo_table_autocenter', scale, panX, panY, height)
+end
 
-    net.Start('holo_table_autocenter')
-    net.WriteEntity(ent)
-    net.WriteFloat(scale)
-    net.WriteFloat(panX)
-    net.WriteFloat(panY)
-    net.WriteFloat(height)
-    net.SendToServer()
-    return true
+-- Focuses the hologram on the physical holo table's own map position.
+-- The table model itself is not drawn in the hologram, but players and
+-- other radar entities around it become readable without manual zooming.
+--- @param ent Entity
+local function sendTableFocus(ent)
+    if not IsValid(ent) then return false end
+    local pos = ent:GetPos()
+    return sendSnapParams(ent, 'holo_table_focus_table',
+        TABLE_FOCUS_SCALE, pos.x, pos.y, TABLE_FOCUS_HEIGHT)
 end
 
 hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
@@ -314,7 +340,8 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
     local reloadKey = input.LookupBinding('+reload')
     local reload = reloadKey and input.IsKeyDown(input.GetKeyCode(reloadKey)) or false
     if reload and not wasReloadDown then
-        if sendAutoCenter(ent) then
+        local sent = cmd:KeyDown(IN_SPEED) and sendTableFocus(ent) or sendAutoCenter(ent)
+        if sent then
             dirty = false
             nextSendTime = SysTime() + SEND_INTERVAL
         end
@@ -393,16 +420,18 @@ hook.Add('HUDPaint', 'holo_table_3d.Controls', function()
 
     local x, y = ScrW() * 0.5, ScrH() - 78
     local hint1 = string.format(
-        '[HOLO TABLE]  %s pan  -  Wheel height  -  %s+Wheel zoom  -  %s recenter  -  %s exit',
+        '[HOLO TABLE]  %s pan  -  Wheel height  -  %s+Wheel zoom  -  %s fit map  -  %s+%s table',
         panKeysHint(),
         bindKey('+speed', 'SHIFT'),
         bindKey('+reload', 'R'),
-        bindKey('+use', 'E'))
+        bindKey('+speed', 'SHIFT'),
+        bindKey('+reload', 'R'))
     local hint2 = string.format(
-        'T entities (%s)  -  G map (%s)  -  hold %s for precision',
+        'T entities (%s)  -  G map (%s)  -  hold %s for precision  -  %s exit',
         onOff(ent:GetEntities()),
         onOff(ent:GetMap()),
-        bindKey('+duck', 'CTRL'))
+        bindKey('+duck', 'CTRL'),
+        bindKey('+use', 'E'))
     local stats = string.format('scale %.1f   height %.1f   pan (%.0f, %.0f)',
         ent:GetScale(), ent:GetHeight(), ent:GetPanX(), ent:GetPanY())
 
@@ -439,5 +468,24 @@ concommand.Add('holo_table_autocenter', function()
 
     MsgC(Color(120, 200, 255),
         string.format('[holo_table] Auto-center: scale=%d pan=(%.0f, %.0f) height=%.1f\n',
+            ent:GetScale(), ent:GetPanX(), ent:GetPanY(), ent:GetHeight()))
+end)
+
+-- Snaps a holo table to the table's own map position at a close tactical
+-- scale. Useful for watching players around the table without manually
+-- scrolling in from the full-map fit every time.
+concommand.Add('holo_table_focus_table', function()
+    local ent = findControlTarget()
+    if not IsValid(ent) then
+        MsgC(Color(255, 120, 120), '[holo_table] No holo_table_3d found.\n')
+        return
+    end
+    if not sendTableFocus(ent) then
+        MsgC(Color(255, 120, 120), '[holo_table] Could not focus table.\n')
+        return
+    end
+
+    MsgC(Color(120, 200, 255),
+        string.format('[holo_table] Table focus: scale=%d pan=(%.0f, %.0f) height=%.1f\n',
             ent:GetScale(), ent:GetPanX(), ent:GetPanY(), ent:GetHeight()))
 end)

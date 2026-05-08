@@ -16,10 +16,14 @@
 local RadarBase = {}
 RadarBase.__index = RadarBase
 
+--- @return Entity
 function RadarBase:GetEntity() return self.entity end
-function RadarBase:GetScale()  return self.entity._holoInvScale end
-function RadarBase:GetOrigin() return self.entity._holoOrigin end
-function RadarBase:GetAngles() return self.entity._holoAngles end
+--- @return number
+function RadarBase:GetScale()  return self.entityTable._holoInvScale end
+--- @return Vector
+function RadarBase:GetOrigin() return self.entityTable._holoOrigin end
+--- @return Angle
+function RadarBase:GetAngles() return self.entityTable._holoAngles end
 
 -- Hot-loop math locals; module-level scratch Vector/Angle are reused
 -- across every Project call so the per-entry allocation drops from
@@ -43,7 +47,7 @@ local PROJ_ANG    = Angle()
 -- Euler. Verified to match LocalToWorld(pos*inv, ang, _holoOrigin,
 -- _holoAngles) within ~1e-5 across diverse cases.
 function RadarBase:Project(pos, ang)
-    local e   = self.entity
+    local e   = self.entityTable
     local s   = e._holoInvScale
     local lx, ly, lz = pos.x * s, pos.y * s, pos.z * s
     local tFx, tFy, tFz = e._holoFx, e._holoFy, e._holoFz
@@ -91,7 +95,7 @@ local function loadModules()
         local mod = setmetatable({}, RadarBase)
         mod.__index = mod
         _G.RADAR = mod
-        local ok, err = pcall(include, 'radar/' .. fname)
+        local ok, err = pcall(include, 'entities/holo_table_3d/radar/' .. fname)
         _G.RADAR = nil
         if not ok then
             MsgC(Color(255, 120, 120),
@@ -109,17 +113,19 @@ loadModules()
 -- inst -> RADAR -> RadarBase, so modules see a `self` that has both
 -- their own methods and the base accessors.
 function ENT:InitializeRadar()
-    self.Radars = {}
+    local selfTbl = self:GetTable()
+    selfTbl.Radars = {}
     for _, mod in ipairs(registry) do
-        local inst = setmetatable({ entity = self }, mod)
+        local inst = setmetatable({ entity = self, entityTable = selfTbl }, mod)
         if isfunction(inst.Initialize) then inst:Initialize() end
-        self.Radars[mod.Name] = inst
+        selfTbl.Radars[mod.Name] = inst
     end
 end
 
 function ENT:ThinkRadar()
-    if not self.Radars then self:InitializeRadar() end
-    for _, inst in pairs(self.Radars) do
+    local selfTbl = self:GetTable()
+    if not selfTbl.Radars then self:InitializeRadar() end
+    for _, inst in pairs(selfTbl.Radars) do
         if isfunction(inst.Think) then inst:Think() end
     end
 end
@@ -130,16 +136,34 @@ end
 -- pull from self._holo* (staged once per frame by
 -- ENT:UpdateHologramTransform in cl_init.lua).
 function ENT:DrawRadar()
-    if not self.Radars then return end
-    for _, inst in pairs(self.Radars) do
+    local radars = self:GetTable().Radars
+    if not radars then return end
+    for _, inst in pairs(radars) do
         if isfunction(inst.Draw) then inst:Draw() end
     end
 end
 
 function ENT:CleanupRadar()
-    if not self.Radars then return end
-    for _, inst in pairs(self.Radars) do
+    local selfTbl = self:GetTable()
+    if not selfTbl.Radars then return end
+    for _, inst in pairs(selfTbl.Radars) do
         if isfunction(inst.OnRemove) then inst:OnRemove() end
     end
-    self.Radars = nil
+    selfTbl.Radars = nil
 end
+
+concommand.Add('holo_table_radar_reload', function()
+    loadModules()
+
+    local count = 0
+    for _, ent in ents.Iterator() do
+        if ent:GetClass() ~= 'holo_table_3d' then continue end
+        if not (ent.CleanupRadar and ent.InitializeRadar) then continue end
+
+        ent:CleanupRadar()
+        ent:InitializeRadar()
+        count = count + 1
+    end
+
+    print('[holo_table] reloaded radar modules for ' .. count .. ' table(s)')
+end)

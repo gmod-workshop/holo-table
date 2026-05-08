@@ -23,29 +23,35 @@ independently movable / replaceable.
 - `init.lua` — server-side `Initialize` (sets `SIMPLE_USE`),
   `ENT:Use`/`ReleaseController`/`OnRemove` ownership handling,
   `PlayerDisconnected` cleanup, the four control-layer net
-  receivers (`holo_table_autocenter`, `holo_table_setparams`,
-  `holo_table_setlayers`, `holo_table_release`), and `AddCSLuaFile`
-  for every client component including a loop over `radar/*.lua`.
+  receivers (`holo_table_autocenter`, `holo_table_focus_table`,
+  `holo_table_setparams`, `holo_table_setlayers`,
+  `holo_table_release`), and `AddCSLuaFile`
+  for every client component including loops over `map/*.lua` and
+  `radar/*.lua`.
   `setparams` / `setlayers` / `release` are ownership-gated;
-  `setparams` and `autocenter` are clamped to the NetworkVar limits in
-  `shared.lua`. `autocenter` is blocked when the table is controlled by
-  someone else, while remaining usable on unowned tables.
-- `cl_init.lua` — slim coordinator (~375 lines).
+  `setparams`, `autocenter`, and `focus_table` are clamped to the
+  NetworkVar limits in `shared.lua`. `autocenter` / `focus_table` are
+  blocked when the table is controlled by someone else, while remaining
+  usable on unowned tables.
+- `cl_init.lua` — slim coordinator (~410 lines).
   `Initialize` / `Think` / `OnRemove` delegate to per-subsystem
   hooks. `Draw` only calls `DrawModel` so `halo.Render`'s opaque
   silhouette pass works correctly; the holographic content is drawn
-  from a `PostDrawTranslucentRenderables` hook into `ENT:DrawHologram`,
-  which owns the stencil cylinder mask, the 5-plane GPU clip prism +
-  floor plane, and the scene matrix push. It then calls into the
-  subsystem draw entry points (`DrawMap`, `DrawClippedMap`,
+  from a self-installing `PostDrawTranslucentRenderables` hook into
+  `ENT:DrawHologram`, which owns the stencil cylinder mask, the 5-plane
+  GPU clip prism + floor plane, and the scene matrix push. It then calls
+  into the subsystem draw entry points (`DrawMap`, `DrawClippedMap`,
   `DrawBrushEntities`, baked/fallback prop draw paths, `DrawRadar`).
-- `cl_map.lua` — map subsystem. The clipper, brush-mesh cache,
-  prop bounds / csent caches, static-prop and `prop_dynamic`
-  map-dressing bakes/fallbacks, async build pipeline (`Start*` /
-  `Tick*` / `Commit*` / `Destroy*` + the all-in invariance cache),
-  per-frame draw entry points, the auto-center solver
-  (`ENT:ComputeAutoCenter`), and the `holo_table_profile`
-  concommand. Lifecycle hooks `ENT:InitializeMap` / `ENT:CleanupMap`.
+- `cl_map.lua` — ordered include shim for the map subsystem.
+- `map/cl_map_*.lua` — map subsystem fragments. `cl_map_shared.lua`
+  installs hot-reload cleanup and shared internals on `ENT.MapCache`;
+  `cl_map_materials.lua`, `cl_map_prewarm.lua`,
+  `cl_map_static_props.lua`, `cl_map_dynamic_props.lua`,
+  `cl_map_clip.lua`, `cl_map_brushes.lua`, `cl_map_core.lua`, and
+  `cl_map_tools.lua` own the clipper, brush-mesh cache, prop bounds /
+  csent caches, static-prop and `prop_dynamic` map-dressing
+  bakes/fallbacks, async build pipeline, per-frame draw entry points,
+  auto-center solver, and `holo_table_profile`.
 - `cl_radar.lua` — radar subsystem. Module loader, `RadarBase`
   (accessors that every per-entity instance inherits), and the four
   ENT lifecycle hooks (`InitializeRadar` / `ThinkRadar` /
@@ -54,13 +60,16 @@ independently movable / replaceable.
   `RADAR` table populated with any subset of `Initialize` / `Think` /
   `Draw` / `OnRemove`. Currently: `lvs.lua`, `other_vehicle.lua`,
   `player.lua`; `prop_dynamic.lua` is a stub because map dressing is
-  owned by `cl_map.lua`. See "Radar system".
+  owned by `map/cl_map_dynamic_props.lua`. `player.lua` draws live
+  player/weapon miniatures, with a clientside mirror for the local
+  player. See "Radar system".
 - `sh_controls.lua` — shared control layer: server ownership/net
   receivers plus client `+use`-toggled grab,
   per-frame input polling in `CreateMove`, `PlayerBindPress`
   suppression of conflicting binds, HUD overlay, throttled
-  `setparams` send + immediate `setlayers` / `autocenter` send, and
-  the `holo_table_release` / `holo_table_autocenter` concommands.
+  `setparams` send + immediate `setlayers` / `autocenter` /
+  `focus_table` send, and the `holo_table_release` /
+  `holo_table_autocenter` / `holo_table_focus_table` concommands.
   See "Interactive controls".
 
 **Decision:** Subsystem boundaries follow entity-style hook naming
@@ -70,6 +79,29 @@ idiomatic GMod and lets `cl_init.lua` stay declarative — every hook
 call is a plain method on `self`. Sub-files attach their methods
 straight onto `ENT` and add file-local helpers / caches for state
 that doesn't need to live on the instance.
+
+**Decision:** The main hologram render hook is lifecycle-gated.
+`cl_init.lua` installs `holo_table_3d.DrawHologram` into
+`PostDrawTranslucentRenderables` from `ENT:Initialize`, removes it after
+the last table is gone, and self-removes defensively if a draw tick finds
+no tables. This avoids scanning entities every frame on maps that do not
+have a holo table. The active-table loop uses
+`ipairs(ents.FindByClass('holo_table_3d'))`; the GMod wiki says
+`FindByClass` is faster for single-class lookup, and local client
+benchmarks matched that: with zero holo tables / 842 entities, 2000
+calls were ~55.8 ms via `FindByClass` versus ~117.5 ms via
+`ents.Iterator()` + `GetClass()`. On a busy class (`beam`, 275 ents),
+`FindByClass` was still faster (~71.1 ms vs ~119.5 ms).
+
+**Decision:** The map subsystem is split by responsibility, but it is not
+loaded dynamically. `cl_map.lua` explicitly includes the fragments in
+dependency order: shared → materials → prewarm → static props →
+dynamic props → clip → brushes → core → tools. Shared cross-fragment
+state lives on `ENT.MapCache` (`MapCache` locals inside the fragments), while
+entity-facing behavior remains on `ENT`. This gives normal GMod
+auto-refresh, useful stack traces, and a clear place for shared
+internals without reintroducing a 2600-line file or a custom
+`file.Read`/`CompileString` loader.
 
 ## Clipping volume
 
@@ -287,13 +319,39 @@ sounds as we shove them around with `SetPos`.
   / `SetModelScale` synced per frame. Team-tinted `DrawModel` via a
   file-local `tintFor(tableTeam, entTeam)` → friendly/hostile/neutral
   `render.SetColorModulation`; neutral when either side is team 0.
+  Also mirrors LVS bullet tracers on the holo by observing clientside
+  `util.Effect` calls and validating them against live `LVS:GetBullet`
+  entries.
 - `other_vehicle.lua` — LFS / SW vehicles whose model coverage is
   patchy; just draws a red marker sphere at the mapped position via
   `self:Project(...)`.
-- `player.lua` — red marker sphere per live player.
+- `player.lua` — live player/weapon miniatures. Remote players draw
+  their real entity and active weapon at a temporary projected pose, then
+  restore the source entity immediately. The local player uses a
+  `ClientsideModel` mirror because first-person local-player drawing may
+  be suppressed by the engine; its active weapon uses a separate mirror
+  that is bone-merged/attached to the player mirror.
 - `prop_dynamic.lua` — stub only. `prop_dynamic` map dressing moved to
-  `cl_map.lua` so it can use baked BSP-space meshes and share map
-  fallback/bake lifecycle.
+  `map/cl_map_dynamic_props.lua` so it can use baked BSP-space meshes
+  and share map fallback/bake lifecycle.
+
+**Decision:** Local player animation is copied as solved bone matrices,
+not as input guesses or animation layers. Polling `IN_ATTACK` /
+`IN_RELOAD` would miss SWEP-specific animation events and hold-type
+details; copying animation layers also does not work on the local mirror
+because `Entity:SetLayerSequence` only applies to `BaseAnimatingOverlay`
+entities, while `ClientsideModel` is not one. `player.lua` therefore
+copies the final `LocalPlayer()` bone matrices into the projected mirror
+after `SetupBones()`, including scaled bone translations and bone scale.
+This preserves locomotion, weapon hold poses, firing gestures, and reload
+animations. Toggle for debugging: `holo_table_player_anim_events`.
+
+**Decision:** Player radar models use neutral model lighting instead of
+map lighting. `Entity:DrawModel` in the projected holo position samples
+the map's lighting there, so players can become nearly black on dark
+maps. `player.lua` wraps the player/weapon radar draw in
+`render.SuppressEngineLighting(true)` and `render.ResetModelLighting`.
+Brightness is tunable with `holo_table_player_light` (default `1`).
 
 **Rejected: drawing csent ghosts inside the `m2` /
 `cam.PushModelMatrix` block.** `Entity:DrawModel` ignores the model
@@ -320,6 +378,17 @@ identical either way; the registry-as-table version was strictly more
 ceremony for no extra capability. The hook-based version (modules
 populate the registry as a side effect of being included) is the one
 in tree.
+
+**Decision:** LVS tracer detection is source-based, not effect-name
+based. LVS and third-party LVS addons may use arbitrary tracer effect
+names, so `radar/lvs.lua` wraps clientside `util.Effect`, reads the
+effect data's material index, resolves it through `LVS:GetBullet(id)`,
+and only records the tracer when the corresponding bullet originated
+from an LVS entity and the bullet's `TracerName` matches the emitted
+effect. The holo renders the result as short-lived projected beams in
+the radar layer. This is intentionally clientside and opportunistic:
+if an LVS weapon bypasses `util.Effect` or does not expose a bullet
+entry, the table simply will not show that tracer.
 
 ## Scale pivot and pan
 
@@ -384,10 +453,11 @@ on every input event so the table reacts the same frame; the
 server's snapshot replays the ordinary control input
 (`holo_table_setparams`) after clamping / ownership checks within
 ~RTT. `holo_table_setparams` is throttled to ~30 Hz
-(`SEND_INTERVAL = 0.033`) when `dirty`; `holo_table_setlayers` and
-`holo_table_autocenter` ship immediately on the edge. `autocenter`
-still uses client-computed fit params, but the server clamps them and
-rejects attempts to change a table controlled by another player.
+(`SEND_INTERVAL = 0.033`) when `dirty`; `holo_table_setlayers`,
+`holo_table_autocenter`, and `holo_table_focus_table` ship
+immediately on the edge. `autocenter` and `focus_table` still use
+client-computed params, but the server clamps them and rejects attempts
+to change a table controlled by another player.
 
 **Rejected: Server-authoritative input (write only on snapshot
 arrival).** Adds RTT/2 of input lag to every pan/scroll, which is
@@ -442,6 +512,14 @@ preference); the duplication is ~12 lines and keeps the dev tool
 decoupled from the control module. The author has flagged
 `holo_table_profile` as eventually-removable debug code, so
 consolidation is deliberately deferred.
+
+**Decision:** Table-focus is a close tactical snap, not another map fit.
+While controlling a table, `+speed`+`+reload` calls
+`holo_table_focus_table`; the concommand is also available directly. It
+sets scale `8`, pan to the physical table entity's world `x/y`, and
+height `28`. The table model itself is not drawn in the holo, but this
+frames nearby players around the table without repeated manual zooming,
+and the slightly elevated height keeps the surrounding floor visible.
 
 **Decision:** Cleanup paths are explicit: `ENT:ReleaseController`
 clears `self.Controller` and notifies the client; `ENT:OnRemove`
@@ -608,6 +686,30 @@ scale-specific; `prop_dynamic` bakes are signature-specific and rebuilt
 when the watcher sees added/removed/reskinned stable entities. Moving
 `prop_dynamic`s stay on the fallback path.
 
+## Lua allocation profile
+
+**Current estimate:** One visible spawned table on the current test map
+allocates roughly **21 KB/frame** on the Lua heap in steady state after
+static and dynamic prop bakes are ready. A GC-paused wrapper probe over
+240 frames measured total client Lua allocation at ~33.8 KB/frame, with
+the holo table draw hook accounting for ~21.0 KB/frame.
+
+Breakdown from that probe:
+- `DrawBrushEntities` — ~15.5 KB/frame.
+- `DrawBakedDynamicProps` — ~2.9 KB/frame.
+- `UpdateHologramTransform` — ~1.2 KB/frame.
+- `DrawClippedMap`, `DrawMap`, and `DrawRadar` — each under
+  ~0.4 KB/frame.
+- `DrawBakedStaticProps` — ~0.05 KB/frame.
+
+**Decision:** Treat these as directionally useful profiling numbers, not
+portable constants. They depend on the map, number of visible tables,
+which bakes are ready, and what other addons are doing. The important
+shape is stable: steady allocation is now dominated by live brush-entity
+drawing, not static props, radar, or worldspawn. Build phases allocate
+much more transient memory because they create vertex tables and IMeshes;
+that is a separate budget from frame steady state.
+
 ## Known limitations / deferred work
 
 - **Translucent draw ordering.** Translucent / alpha-tested flags are
@@ -629,9 +731,12 @@ when the watcher sees added/removed/reskinned stable entities. Moving
   surrounding interior geometry anyway.
 - **Brush-entity cost.** Static props and `prop_dynamic` map dressing
   now have baked all-in paths, so brush entities are often the next
-  meaningful steady-frame cost. A future pass could identify stable
-  brush entities (`func_brush`, stable `C_BaseToggle`, etc.) and bake
-  those while leaving doors/trains/rotating entities live.
+  meaningful steady-frame cost. Recent allocation profiling showed
+  `DrawBrushEntities` at ~15.5 KB/frame on a map with 118 brush-model
+  entities, mostly from live entity pose/matrix work. A future pass
+  could identify stable brush entities (`func_brush`, stable
+  `C_BaseToggle`, etc.) and bake those while leaving doors/trains/
+  rotating entities live.
 - **Semi all-in cache.** When the cylinder is *almost* all-in (a
   handful of faces cross the boundary), every parameter change still
   triggers a full rebuild. A split where static interior geometry is
