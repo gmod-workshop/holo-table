@@ -22,15 +22,26 @@ local getMatByTexinfo = MapCache.getMatByTexinfo
 local resolveMat = MapCache.resolveMat
 local resolveProj = MapCache.resolveProj
 local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
+
+--- Builds the clipped worldspawn mesh list. Iterates worldspawn faces only;
+--- each surviving face becomes triangles in a per-material group. Both fast
+--- (fully interior) and slow (boundary) paths feed the same group list,
+--- which is then chunked into IMeshes. See DESIGN.md "Build pipeline" / "Culling".
+--- @param scale number
+--- @param height number
+--- @param panX number
+--- @param panY number
+--- @param useYield boolean If true, yields when the per-frame budget is exceeded.
+--- @param stats table? Optional table populated with stage timings + counts.
+--- @return table[] meshes List of { mat: IMaterial, mesh: IMesh } records.
 function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.faces then return {} end
 
     if stats then stats.tStart = SysTime() end
 
-    -- Frame budget bookkeeping. Used both to throttle the per-face clip
-    -- loop below and to make getMatByTexinfo's first-call lookup build
-    -- (~250 ms on rp_venator) yieldable instead of a single hitch.
+    -- Frame budget: throttles the per-face loop AND makes getMatByTexinfo's
+    -- ~250 ms first-call lookup yieldable instead of one big hitch.
     local matByTexinfoLocal
     local function buildDeadlineFn() return matByTexinfoLocal end
     local function bumpBuildDeadline()
@@ -40,9 +51,6 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     local matByTexinfoBumpFn     = useYield and bumpBuildDeadline or nil
     if useYield then bumpBuildDeadline() end
 
-    -- The adapter builds one UnlitGeneric material per unique texinfo.
-    -- Used as a fallback for LightmappedGeneric world materials, which
-    -- render black without a lightmap. Cached across builds.
     local matByTexinfo = getMatByTexinfo(matByTexinfoDeadlineFn, matByTexinfoBumpFn) or {}
 
     local axis = self:GetUp()
@@ -54,26 +62,19 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     local floorOffset = scale * (25 - height) + pivotZ
     local floorPlane = { n = -axis, d = -floorOffset }
 
-    -- Pan shifts the cylinder horizontally in BSP space; wall planes have
-    -- distance d = radius + panOffset.n (axis-perpendicular component of
-    -- panOffset onto each wall normal). Horizontal cull subtracts the
-    -- horizontal component of panOffset before measuring distance.
+    -- Pan shifts the cylinder horizontally in BSP space. Wall planes get
+    -- d = radius + panOffset.n; horizontal cull subtracts panHoriz too.
     local panOffset = Vector(panX or 0, panY or 0, 0)
     local panHoriz = panOffset - axis * panOffset:Dot(axis)
 
-    -- Scalar components of the table-space basis. The per-face hot loop
-    -- reads each face's bounding sphere and projects/rejects against the
-    -- cylinder; doing that with Vector temporaries allocates a handful of
-    -- Vectors per face which dominates GC time on big maps. The same math
-    -- with bare numbers avoids all of those allocations.
+    -- Scalar basis: per-face hot loop runs without Vector temporaries.
     local axisX, axisY, axisZ = axis.x, axis.y, axis.z
     local rightX, rightY, rightZ = right.x, right.y, right.z
     local fwdX, fwdY, fwdZ = fwd.x, fwd.y, fwd.z
     local panHX, panHY, panHZ = panHoriz.x, panHoriz.y, panHoriz.z
 
-    -- cos/sin are kept on each plane so the per-face sphere test below can
-    -- project the face center onto every wall normal in the (right, fwd)
-    -- basis without redoing the angle math.
+    -- cos/sin per wall plane so the per-face sphere test can project the
+    -- center onto every wall normal in (right, fwd) without redoing trig.
     local segments = 32
     local wallPlanes = {}
     for i = 0, segments - 1 do
@@ -89,11 +90,6 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
         }
     end
 
-    -- resolveMat / resolveProj live at module level so the background
-    -- tri-cache prewarm (startTriCachePrewarm) can share their per-tinfo
-    -- caches. Bind matByTexinfo here so the per-face hot loop calls
-    -- resolveMat with one arg via a local closure (cheaper than passing
-    -- it on every call).
     local function resolveMatLocal(tinfo) return resolveMat(tinfo, matByTexinfo) end
 
     local groups = {}
@@ -103,10 +99,8 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     local sPlaneChecked, sPlaneSkipped, sPlaneCut = 0, 0, 0
     local sOutputTris = 0
 
-    -- Iterate worldspawn (model 1) faces only. Brush-entity faces live on
-    -- models 2..N and are stored in their entity's local space; rendering
-    -- them here would put them at the BSP origin instead of at their live
-    -- entity pose. DrawBrushEntities handles those separately.
+    -- Worldspawn-only iteration. Brush-entity faces are stored entity-local
+    -- and would render at the BSP origin; DrawBrushEntities handles them.
     local worldFaces = bsp.models and bsp.models[1] and bsp.models[1].faces or bsp.faces
     for fi = 1, #worldFaces do
         if yieldDeadline and SysTime() > yieldDeadline then
@@ -125,11 +119,7 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
         sFacesTotal = sFacesTotal + 1
 
 
-        -- Per-face bounding sphere, cached on the adapted face table itself.
-        -- Survives subsequent rebuilds; recomputed only when the adapter
-        -- rebuilds the face tables.
-        -- Stored as scalars (cx/cy/cz/fr) so the per-face cull math below
-        -- can run without ever materialising a Vector.
+        -- Per-face bounding sphere, scalar, cached on the face table.
         local cull = face._holoCull
         if not cull or not cull.cx then
             local n = #edges
@@ -153,33 +143,23 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
 
         local cx, cy, cz, fr = cull.cx, cull.cy, cull.cz, cull.fr
         local along = cx * axisX + cy * axisY + cz * axisZ
-        -- centerFromPan = (center - axis*along) - panHoriz, scalarised.
         local cfx = cx - axisX * along - panHX
         local cfy = cy - axisY * along - panHY
         local cfz = cz - axisZ * along - panHZ
         local horizDist2 = cfx * cfx + cfy * cfy + cfz * cfz
 
-        -- Reject faces fully outside the cylinder. Using squared distance
-        -- avoids the per-face sqrt; the `radius + fr` term is positive so
-        -- squaring preserves the comparison direction.
         local outerR = radius + fr
         if horizDist2 > outerR * outerR then sFacesRejected = sFacesRejected + 1; continue end
         if along + fr < floorOffset then sFacesRejected = sFacesRejected + 1; continue end
 
-        -- needsWallClip iff horizDist + fr > radius. When radius < fr the
-        -- inequality holds for any horizDist, so force-clip; otherwise the
-        -- squared form is exact.
+        -- needsWallClip iff horizDist + fr > radius. Squared form is exact
+        -- when radius >= fr; force-clip when the cylinder is smaller.
         local insideR = radius - fr
         local needsWallClip = insideR < 0 or horizDist2 > insideR * insideR
         local needsFloorClip = along - fr < floorOffset
 
-        -- Fast path: face fits entirely inside the cylinder, no clipping
-        -- needed. The triangulation (positions + normal + UVs) depends only
-        -- on the face geometry and texinfo, never on scale/pan/height, so
-        -- it's cached on `face._holoTris` and reused verbatim across every
-        -- subsequent rebuild. This collapses ~99% of the per-face work to
-        -- a few table-reference appends on maps where the cylinder
-        -- contains nearly everything.
+        -- Fast path: face is fully inside. Triangulation is invariant of
+        -- scale/pan/height -- cached on face._holoTris and reused verbatim.
         if not needsWallClip and not needsFloorClip then
             local tcache = face._holoTris
             if not tcache or tcache.gen ~= CACHE_GENERATION then
@@ -221,10 +201,7 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
             end
             if tcache.skip then continue end
 
-            -- Cache the resolved group ref against this build's `groups`
-            -- identity so subsequent fast-path faces skip the hash lookup.
-            -- Invalidated automatically when a new build creates a new
-            -- groups table.
+            -- One-shot lastGroups/lastGroup ref skips the per-face hash lookup.
             local group = tcache.lastGroups == groups and tcache.lastGroup
             if not group then
                 group = groups[tcache.matKey]
@@ -249,11 +226,8 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
         local poly = {}
         for ei = 1, #edges do poly[ei] = edges[ei][1] end
 
-        -- Slow path: face crosses the cylinder boundary. Project the
-        -- face's bounding sphere onto each wall normal (cR*cos+cF*sin)
+        -- Slow path: project the bounding sphere onto each wall normal
         -- and skip planes whose half-space already contains the sphere.
-        -- Without this step the clipper would visit all 32 walls per
-        -- face even though typically only 2-4 actually cut.
         if needsWallClip then
             sFacesClipped = sFacesClipped + 1
             local cR = cfx * rightX + cfy * rightY + cfz * rightZ
@@ -278,9 +252,8 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
 
 
         if #poly >= 3 then
-            -- Group by basetexture so the per-texinfo adapter materials
-            -- collapse into one batch per texture. Falls back to material
-            -- name when there is no basetexture.
+            -- Group by basetexture so per-texinfo adapter materials collapse
+            -- into one batch per texture.
             local btn = mat:GetTexture('$basetexture')
             local matKey = btn and btn:GetName() or mat:GetName()
             local group = groups[matKey]
@@ -317,24 +290,11 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
 
     if stats then stats.tClipEnd = SysTime() end
 
-    -- IMesh creation can also exceed one frame's budget on big maps, so
-    -- yield here too. The list is published on `self.ClipPending` so that
-    -- any partial IMesh allocations can be freed if the coroutine is
-    -- abandoned mid-pass (entity removed, build restarted, etc.).
-    --
-    -- Static mesh.Begin cost is roughly linear in vertex count
-    -- (~0.45 us/vert on 7th-gen hardware); a single group with ~30k
-    -- verts spends ~13 ms in one unyieldable call and shows up as a
-    -- frame hitch. Split big groups into MAX_VERTS_PER_MESH chunks
-    -- (each one a separate IMesh under the same material) so every
-    -- mesh.End call stays under the frame budget. Multiple
-    -- IMeshes per material cost one extra draw call apiece, which is
-    -- cheap relative to the avoided stutter.
-    --
-    -- Yield BEFORE the chunk if its predicted cost would push the
-    -- current resume past the deadline; the post-chunk check alone
-    -- lets a 4 ms chunk land on top of 3 ms of accrued work and
-    -- produce a 7 ms resume.
+    -- Chunked IMesh emit. Static mesh.Begin is ~0.45 us/vert, so a 30k-vert
+    -- group blocks for ~13 ms in one unyieldable call. Split big groups
+    -- under MAX_VERTS_PER_MESH; yield BEFORE a chunk if its predicted cost
+    -- pushes past the deadline. Partial allocations are tracked on
+    -- selfTbl.ClipPending so abandoned coroutines can free them.
     local MAX_VERTS_PER_MESH = 8000
     local PER_VERT_SEC = 0.5e-6
     local list = {}
@@ -349,7 +309,6 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
             local offset = 0
             while offset < n do
                 local take = math_min(MAX_VERTS_PER_MESH, n - offset)
-                -- Round down to a multiple of 3 so we never split a tri.
                 take = take - (take % 3)
                 if take == 0 then break end
                 if yieldDeadline and SysTime() + take * PER_VERT_SEC > yieldDeadline then
@@ -389,6 +348,7 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
 
     return list
 end
+
 function ENT:DestroyClippedMap()
     local selfTbl = self:GetTable()
     if not selfTbl.ClippedMeshes then return end
@@ -398,9 +358,8 @@ function ENT:DestroyClippedMap()
     selfTbl.ClippedMeshes = nil
 end
 
--- Frees the cached "all-in" build. Items in this list also carry
--- borrowed=true while cached so DestroyClippedMap leaves them alone; this
--- function is the sole owner that ever frees them.
+--- Frees the cached "all-in" build. Items in this list carry borrowed=true
+--- while cached so DestroyClippedMap leaves them alone; this is the sole owner.
 function ENT:DestroyAllInCache()
     local selfTbl = self:GetTable()
     if not selfTbl.AllInMeshes then return end
@@ -411,11 +370,14 @@ function ENT:DestroyAllInCache()
     selfTbl.AllInMeshes = nil
 end
 
--- Returns true when the cylinder (radius `scale*90` around (panX, panY)
--- in BSP space, floor plane at `scale*(25-height) + pivotZ` along the
--- table up axis) wholly contains the worldspawn AABB. When this holds
--- the clipper produces output identical to any other "all-in" config
--- with the same scale/height, so rebuilding can be skipped.
+--- True iff the cylinder fully contains the worldspawn AABB. When this
+--- holds, the clipper output is identical to any other all-in config so
+--- rebuilding can be skipped.
+--- @param scale number
+--- @param height number
+--- @param panX number
+--- @param panY number
+--- @return boolean
 function ENT:CylinderContainsMap(scale, height, panX, panY)
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.models or not bsp.models[1] then return false end
@@ -442,10 +404,12 @@ function ENT:CylinderContainsMap(scale, height, panX, panY)
     return true
 end
 
--- Horizontal-only all-in check used by baked prop renderers. Height/floor
--- changes do not invalidate baked prop meshes: the existing GPU floor clip
--- plane crops IMeshes vertically. Only scale/pan can make a full-map bake
--- overdraw horizontally enough that the legacy per-prop cull is preferable.
+--- Horizontal-only all-in check used by baked prop renderers. Vertical
+--- changes don't invalidate baked meshes -- the GPU floor clip plane crops them.
+--- @param scale number
+--- @param panX number
+--- @param panY number
+--- @return boolean
 function ENT:CylinderHorizContainsMap(scale, panX, panY)
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.models or not bsp.models[1] then return false end
@@ -469,20 +433,15 @@ function ENT:CylinderHorizContainsMap(scale, panX, panY)
     return true
 end
 
--- Draws the cached clipped worldspawn mesh under its own scene matrix.
--- Bounded in 3D against the cylinder volume by the build pipeline, so
--- it must be drawn outside the screen-space stencil and the GPU clip
--- prism used for radars (the prism would chop off tall content).
+--- Draws the cached clipped worldspawn mesh under its own scene matrix.
+--- Bounded in 3D by the build pipeline, so it draws OUTSIDE the screen-space
+--- stencil and the GPU clip prism (which would chop tall content).
 function ENT:DrawClippedMap()
     local selfTbl = self:GetTable()
     local clippedMeshes = selfTbl.ClippedMeshes
     if not clippedMeshes then return end
     if not self:GetMap() then return end
 
-    -- Same pinned-pivot + pan transform the m2 block in DrawHologram
-    -- uses for everything else; keeps the clipped mesh aligned with the
-    -- unclipped fallback and DrawStaticProps. Sourced from the shared
-    -- _holo* fields staged by ENT:UpdateHologramTransform.
     local m = Matrix()
     m:SetTranslation(selfTbl._holoOrigin)
     m:SetAngles(selfTbl._holoAngles)
@@ -492,10 +451,8 @@ function ENT:DrawClippedMap()
     render.PushFilterMin(TEXFILTER.ANISOTROPIC)
     render.SetLightingMode(2)
 
-    -- pcall guards against a NULL IMesh aborting the draw before the
-    -- Pop calls below run; leaking a Push per frame overflows the
-    -- texture-filter stack within a few seconds and breaks every
-    -- subsequent render in the addon.
+    -- pcall guards against a NULL IMesh aborting before the Pop calls run;
+    -- a leaked Push per frame overflows the texture-filter stack.
     cam.PushModelMatrix(m)
         local ok, err = pcall(function()
             for _, item in ipairs(clippedMeshes) do
@@ -516,12 +473,13 @@ function ENT:DrawClippedMap()
 end
 
 
--- Per-bmodel mesh cache. Brush-entity faces in the BSP are stored relative
--- to the entity's local origin, so the cached IMesh sits in local space
--- and DrawBrushEntities transforms it by the live entity's pos/ang. Shared
--- across holo_table_3d instances; cleared on map load via the adapter hook.
-
-
+--- Commits a finished build, swaps in the new mesh list, and stamps the
+--- "all-in" cache when applicable.
+--- @param list table[]
+--- @param scale number
+--- @param height number
+--- @param panX number
+--- @param panY number
 function ENT:CommitClippedBuild(list, scale, height, panX, panY)
     local selfTbl = self:GetTable()
     self:DestroyClippedMap()
@@ -538,8 +496,7 @@ function ENT:CommitClippedBuild(list, scale, height, panX, panY)
     end
 end
 
--- Destroys any IMesh objects that the in-flight build had allocated before
--- it was abandoned mid-pass.
+--- Frees IMeshes from a build that was abandoned mid-pass.
 function ENT:DestroyPendingBuild()
     local selfTbl = self:GetTable()
     if not selfTbl.ClipPending then return end
@@ -549,11 +506,9 @@ function ENT:DestroyPendingBuild()
     selfTbl.ClipPending = nil
 end
 
--- Kicks off a clipped-map rebuild for the current scale/height. The output
--- is invariant for any "all-in" cylinder, so two short-circuits apply:
---   1. The currently-displayed build is already all-in → no work to do.
---   2. We have a cached all-in build from a prior session → swap it back in.
--- Otherwise spawn a coroutine to clip face-by-face across multiple frames.
+--- Kicks off (or short-circuits to) a clipped-map rebuild for current params.
+--- All-in current display reuses, all-in with cached AllInMeshes swaps it
+--- back in, otherwise spawns a coroutine.
 function ENT:StartClippedBuild()
     self:DestroyPendingBuild()
     local selfTbl = self:GetTable()
@@ -591,8 +546,7 @@ function ENT:StartClippedBuild()
     end)
 end
 
--- Resumes the in-flight build for one frame's worth of work. Commits the
--- result when the coroutine finishes.
+--- Resumes the in-flight build for one frame's slice; commits when finished.
 function ENT:TickClippedBuild()
     local selfTbl = self:GetTable()
     local co = selfTbl.ClipCoroutine
@@ -614,14 +568,14 @@ function ENT:TickClippedBuild()
 end
 
 
+--- Layer-toggle dispatch. Adapter fallback for unclipped first-frame
+--- worldspawn (vestigial since NikNaks exposes no prebuilt meshes), plus
+--- the entity (BSP-prefab) layer when GetEntities() is on.
 function ENT:DrawMap()
     local map = bsp2.GetModelInfo()
     if not map then return end
     local selfTbl = self:GetTable()
 
-    -- Legacy adapter fallback. The NikNaks adapter currently exposes no
-    -- prebuilt meshes/entities here; the real map paths are DrawClippedMap,
-    -- DrawBrushEntities, and the prop bakes.
     if self:GetMap() and not selfTbl.ClippedMeshes then
         for k, v in ipairs(map.meshes) do
             local mat = map.materials[k]

@@ -1,14 +1,15 @@
--- LVS radar: mirror props for any ent with a .LVS marker, color-tinted
--- by AITEAM relative to the table's owning team, plus projected LVS
--- bullet tracers captured from the clientside effect path.
+-- LVS radar: mirror props for any ent with .LVS, AITEAM-tinted relative to
+-- the table's team, plus projected LVS bullet tracers from util.Effect.
 
--- Subtle tints so the source model is still readable. Friendly = same
--- AITEAM as the table, Hostile = different non-zero AITEAM, Neutral =
--- either side is team 0.
+-- Friendly = same AITEAM as the table; Hostile = different non-zero;
+-- Neutral = either side is team 0.
 local TINT_FRIENDLY = { 0.45, 0.65, 1.00 }
 local TINT_HOSTILE  = { 1.00, 0.45, 0.45 }
 local TINT_NEUTRAL  = { 1.00, 1.00, 1.00 }
 
+--- @param tableTeam number
+--- @param entTeam number
+--- @return number[] rgb
 local function tintFor(tableTeam, entTeam)
     if tableTeam == 0 or entTeam == 0 then return TINT_NEUTRAL end
     if entTeam == tableTeam then return TINT_FRIENDLY end
@@ -46,6 +47,8 @@ tracerState = {
 }
 _G.HOLO_TABLE_3D_LVS_TRACERS = tracerState
 
+--- @param name string Effect name; substring-matched against known palette keys.
+--- @return Color
 local function tracerColor(name)
     name = string.lower(tostring(name or ''))
     if name:find('red', 1, true) then return TRACER_COLORS.red end
@@ -58,6 +61,10 @@ local function tracerColor(name)
     return TRACER_COLORS.default
 end
 
+--- Records a tracer if the effect data resolves to a live LVS bullet whose
+--- TracerName matches the emitted effect. Source-based, not name-based.
+--- @param effectName string
+--- @param data CEffectData
 local function captureTracerEffect(effectName, data)
     if not (data and LVS and LVS.GetBullet) then return end
 
@@ -80,9 +87,7 @@ local function captureTracerEffect(effectName, data)
     local shooter = bullet.Entity
     if not (IsValid(shooter) and shooter.LVS) then return end
 
-    -- Generic LVS bullet effects carry their own tracer effect name on
-    -- the bullet. This filters smoke/exhaust effects whose material
-    -- index may coincidentally reference a live bullet.
+    -- Filter smoke / exhaust whose material index might collide with a live bullet.
     if bullet.TracerName ~= effectName then return end
 
     tracerState.items[id] = {
@@ -104,9 +109,9 @@ tracerState.restore = function()
     end
 end
 
--- Sets up a client-side mirror prop for hologram-pose drawing. SetNoDraw
--- so the engine's auto-draw doesn't show a second full-size copy in PVS;
--- physics/collision dropped because we shove SetPos every frame.
+--- Builds a NoDraw clientside prop used as the holo mirror for one LVS source.
+--- @param model string
+--- @return Entity?
 local function makeMirror(model)
     local cs = ents.CreateClientProp(model)
     if not IsValid(cs) then return nil end
@@ -117,6 +122,8 @@ local function makeMirror(model)
     return cs
 end
 
+--- Draws projected LVS bullet tracers in the radar layer.
+--- @param radar table Owning RADAR instance (provides Project / GetScale).
 local function drawTracers(radar)
     if not (LVS and LVS.GetBullet) then return end
 
@@ -157,8 +164,8 @@ function RADAR:Initialize()
     self.Tracked = {}
 end
 
--- Single sweep: drop stale entries (and their mirrors), then add a
--- mirror for any new LVS ent we don't already track.
+--- Single sweep: drops stale entries + their mirrors, then adds mirrors
+--- for new LVS ents.
 function RADAR:Think()
     local fresh = {}
     for _, v in pairs(self.Tracked) do

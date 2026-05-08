@@ -1,9 +1,5 @@
--- Interactive control mode for holo_table_3d. Server owns ownership
--- (one controller per table) and authoritative NetworkVar values; the
--- client mirrors the active grant, polls input in CreateMove, and ships
--- parameters back to the server (throttled) for the authoritative
--- replay. Lifecycle hooks ENT:InitializeControls / ENT:CleanupControls
--- are called from init.lua's Initialize / OnRemove.
+-- Interactive control mode. Server owns ownership + authoritative NetworkVar
+-- values; client mirrors the grant, polls input, and ships params back.
 
 if SERVER then
     util.AddNetworkString('holo_table_autocenter')
@@ -13,9 +9,8 @@ if SERVER then
     util.AddNetworkString('holo_table_setlayers')
     util.AddNetworkString('holo_table_release')
 
-    -- SIMPLE_USE fires Use once per E press (instead of base_anim's
-    -- default continuous-while-held), so the controls toggle reliably
-    -- and doesn't flicker when the player holds the key.
+    --- SIMPLE_USE fires once per E press; base_anim's default is
+    --- continuous-while-held and would flicker the toggle.
     function ENT:InitializeControls()
         self:SetUseType(SIMPLE_USE)
     end
@@ -24,10 +19,10 @@ if SERVER then
         self:ReleaseController()
     end
 
-    -- Toggles interactive control of this table for the activator. Each
-    -- player can only control one table at a time; grabbing a new one
-    -- implicitly releases any previous. Other players are locked out
-    -- until the current controller releases or disconnects.
+    --- Toggles control of this table for the activator. A player can only
+    --- control one table at a time; grabbing a new one releases any previous.
+    --- @param activator Entity
+    --- @param caller Entity
     function ENT:Use(activator, caller)
         if not (IsValid(activator) and activator:IsPlayer()) then return end
 
@@ -48,6 +43,7 @@ if SERVER then
         net.Send(activator)
     end
 
+    --- Clears the controller and notifies the previous owner's client.
     function ENT:ReleaseController()
         local ply = self.Controller
         self.Controller = nil
@@ -59,6 +55,8 @@ if SERVER then
         end
     end
 
+    --- Shared handler for autocenter / focus_table: client computes the
+    --- target params, server clamps and rejects if owned by someone else.
     local function receiveSnapParams(_, ply)
         local ent = net.ReadEntity()
         local scale = math.Clamp(net.ReadFloat(), 1, 300)
@@ -76,9 +74,8 @@ if SERVER then
     net.Receive('holo_table_autocenter', receiveSnapParams)
     net.Receive('holo_table_focus_table', receiveSnapParams)
 
-    -- Live parameter feed from the active controller. Clamped to the
-    -- NetworkVar limits in shared.lua so a malicious client can't push
-    -- nonsense values; ownership check keeps non-controllers locked out.
+    -- Live parameter feed from the active controller. Clamped to NetworkVar
+    -- limits in shared.lua; ownership-gated.
     net.Receive('holo_table_setparams', function(_, ply)
         local ent    = net.ReadEntity()
         local scale  = math.Clamp(net.ReadFloat(), 1, 300)
@@ -93,8 +90,6 @@ if SERVER then
         ent:SetPanY(panY)
     end)
 
-    -- Layer visibility toggles from the active controller. Same ownership
-    -- gate as setparams; bools are unconstrained so no clamp needed.
     net.Receive('holo_table_setlayers', function(_, ply)
         local ent = net.ReadEntity()
         local map = net.ReadBool()
@@ -121,26 +116,15 @@ if SERVER then
     return
 end
 
--- ---------------------------------------------------------------------
--- Client: input polling, HUD, control concommands. Player presses +use
--- on a table to grab control; while controlling, +forward/+back/
--- +moveleft/+moveright pan, mouse wheel adjusts height, +speed+wheel
--- adjusts scale, +reload re-centers, and +speed+reload focuses the
--- table's own map position. Movement keys are read off the
--- cmd's button bits (cmd:KeyDown) so user keybinds are respected.
--- NetworkVar writes are optimistic on the client (snappy) and
--- re-confirmed by the server's next snapshot.
--- ---------------------------------------------------------------------
-
-local PAN_VISUAL_SPEED = 60   -- table-space units / sec at scale=1 (cylinder radius is 90)
-local HEIGHT_STEP      = 10   -- world units per scroll tick (scale-invariant)
-local SCALE_FACTOR     = 1.10 -- multiplicative per shift+scroll tick
+local PAN_VISUAL_SPEED = 60   -- table-space units / sec at scale=1
+local HEIGHT_STEP      = 10
+local SCALE_FACTOR     = 1.10
 local PRECISION_MUL    = 0.25 -- pan/height/zoom step multiplier while +duck held
 local SEND_INTERVAL    = 0.033
-local TABLE_FOCUS_SCALE = 8    -- nearby players read clearly without shrinking the whole map into view
-local TABLE_FOCUS_HEIGHT = 28  -- slightly lifts the focused slice so the table-room floor stays visible
+local TABLE_FOCUS_SCALE  = 8
+local TABLE_FOCUS_HEIGHT = 28
 
--- Mirrors the NetworkVar limits in shared.lua.
+-- Mirrors shared.lua NetworkVar limits.
 local SCALE_MIN, SCALE_MAX   = 1, 300
 local HEIGHT_MIN, HEIGHT_MAX = -500, 500
 local PAN_MIN, PAN_MAX       = -16384, 16384
@@ -173,6 +157,7 @@ net.Receive('holo_table_control', function()
     end
 end)
 
+--- Throttled live parameter feed (scale/height/pan) for the active table.
 --- @param ent Entity
 local function sendParams(ent)
     net.Start('holo_table_setparams')
@@ -184,9 +169,7 @@ local function sendParams(ent)
     net.SendToServer()
 end
 
--- Edge-triggered layer toggles bypass the throttled setparams send so
--- the visibility flip is immediate. Optimistic local write mirrors the
--- pattern used everywhere else in this file.
+--- Edge-triggered layer toggle send; bypasses the throttled setparams send.
 --- @param ent Entity
 local function sendLayers(ent)
     net.Start('holo_table_setlayers')
@@ -196,9 +179,11 @@ local function sendLayers(ent)
     net.SendToServer()
 end
 
--- Table-local pan basis projected onto BSP XY so PanX/PanY (which are
--- world-XY) can be driven by movement keys regardless of how the table
--- is rotated. Falls back to world axes if the table is somehow vertical.
+--- Table-local pan basis projected onto BSP XY so movement keys drive
+--- PanX/PanY consistently regardless of how the table is rotated.
+--- @param ent Entity
+--- @return Vector fwd
+--- @return Vector right
 local function panAxes(ent)
     local ang = ent:GetAngles()
     local fwd, right = ang:Forward(), ang:Right()
@@ -208,9 +193,9 @@ local function panAxes(ent)
     return fwd, right
 end
 
--- Picks a target holo table for a control-mode action issued without an
--- entity reference (concommand): prefers the actively-controlled table,
--- then the entity under the player's crosshair, then the nearest one.
+--- Resolves the holo table for a control concommand: actively-controlled,
+--- then under the crosshair, then nearest.
+--- @return Entity?
 local function findControlTarget()
     if IsValid(controlled) then return controlled end
 
@@ -230,10 +215,15 @@ local function findControlTarget()
     return best
 end
 
--- Applies a precomputed scale/pan/height snap locally and ships the
--- same values to the server. Server replays the clamped authoritative
--- values within ~RTT.
+--- Applies a precomputed snap locally and ships it to the server. Server
+--- replays the clamped authoritative values within ~RTT.
 --- @param ent Entity
+--- @param netName string
+--- @param scale number
+--- @param panX number
+--- @param panY number
+--- @param height number
+--- @return boolean sent
 local function sendSnapParams(ent, netName, scale, panX, panY, height)
     ent:SetScale(scale)
     ent:SetPanX(panX)
@@ -250,11 +240,10 @@ local function sendSnapParams(ent, netName, scale, panX, panY, height)
     return true
 end
 
--- Computes auto-center params for `ent` and ships them to the server.
--- Optimistic local write so the table snaps the same frame; server
--- replays with the (clamped) authoritative values within ~RTT. Returns
--- true if a message was sent. ENT:ComputeAutoCenter lives in cl_map.
+--- Computes auto-center params for ent and ships them to the server.
 --- @param ent Entity
+--- @return boolean sent
+--- @see ENT:ComputeAutoCenter
 local function sendAutoCenter(ent)
     if not (IsValid(ent) and ent.ComputeAutoCenter) then return false end
     local scale, panX, panY, height = ent:ComputeAutoCenter()
@@ -263,10 +252,11 @@ local function sendAutoCenter(ent)
     return sendSnapParams(ent, 'holo_table_autocenter', scale, panX, panY, height)
 end
 
--- Focuses the hologram on the physical holo table's own map position.
--- The table model itself is not drawn in the hologram, but players and
--- other radar entities around it become readable without manual zooming.
+--- Focuses the hologram on the physical holo table's own map position.
+--- The model itself is hidden from the holo, but nearby radar entities
+--- become readable without manual zooming.
 --- @param ent Entity
+--- @return boolean sent
 local function sendTableFocus(ent)
     if not IsValid(ent) then return false end
     local pos = ent:GetPos()
@@ -281,13 +271,11 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
         return
     end
 
-    -- Capture +duck (precision modifier) BEFORE RemoveKey scrubs it,
-    -- otherwise cmd:KeyDown(IN_DUCK) below would always read false.
+    -- Capture +duck BEFORE RemoveKey scrubs it.
     local precise = cmd:KeyDown(IN_DUCK)
     local mul = precise and PRECISION_MUL or 1
 
     -- Suppress player movement so dragging the table doesn't also walk.
-    -- +use is left alone so pressing E on the same table still toggles.
     cmd:ClearMovement()
     cmd:RemoveKey(IN_JUMP)
     cmd:RemoveKey(IN_DUCK)
@@ -295,8 +283,7 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
     local dt = FrameTime()
     if dt <= 0 then return end
 
-    -- Read movement off the cmd's button bits instead of literal WASD
-    -- so user keybinds (ESDF, arrow keys, etc.) drive panning.
+    -- Read off cmd button bits so user keybinds (ESDF, arrows, etc.) work.
     local f = cmd:KeyDown(IN_FORWARD)
     local b = cmd:KeyDown(IN_BACK)
     local l = cmd:KeyDown(IN_MOVELEFT)
@@ -319,8 +306,7 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
     if wheel ~= 0 then
         cmd:SetMouseWheel(0)
         if cmd:KeyDown(IN_SPEED) then
-            -- Precision shrinks the multiplicative step (1.10 -> 1.025
-            -- by default), so a tick is finer without changing direction.
+            -- Precision shrinks the multiplicative step (1.10 -> 1.025 by default).
             local factor = math.pow(1 + (SCALE_FACTOR - 1) * mul, wheel)
             ent:SetScale(math.Clamp(ent:GetScale() * factor, SCALE_MIN, SCALE_MAX))
         else
@@ -330,13 +316,9 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
         dirty = true
     end
 
-    -- Edge-triggered auto-center on +reload. We can't read this off the
-    -- cmd's IN_RELOAD bit because PlayerBindPress below swallows the
-    -- +reload bind (so the engine never sets IN_RELOAD). Poll the raw
-    -- key bound to +reload instead so suppression and detection don't
-    -- fight each other. Bypasses the throttled setparams send for an
-    -- immediate snap; clears dirty so a stale pan/height update doesn't
-    -- overwrite it on the next tick.
+    -- +reload edge: poll raw key, since PlayerBindPress below swallows the
+    -- bind (so IN_RELOAD never fires). Clears `dirty` so a stale param
+    -- update doesn't overwrite the snap on the next tick.
     local reloadKey = input.LookupBinding('+reload')
     local reload = reloadKey and input.IsKeyDown(input.GetKeyCode(reloadKey)) or false
     if reload and not wasReloadDown then
@@ -348,10 +330,7 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
     end
     wasReloadDown = reload
 
-    -- Edge-triggered layer toggles. T flips entities, G flips the map.
-    -- Raw key polling (not cmd:KeyDown) so we don't depend on whatever
-    -- bind those keys happen to fire; the conflicting messagemode /
-    -- +menu_context binds are swallowed by PlayerBindPress below.
+    -- T / G layer toggles, raw-keyed because they have no +command bind.
     local entDown = input.IsKeyDown(KEY_T)
     if entDown and not wasEntDown then
         ent:SetEntities(not ent:GetEntities())
@@ -373,12 +352,8 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
     end
 end)
 
--- Mouse-wheel binds normally fire the weapon-selection HUD (and its
--- click sound) before CreateMove sees the cmd, so cmd:SetMouseWheel(0)
--- isn't enough on its own. +reload normally triggers the held weapon
--- (animation + sound); we consume it so R cleanly drives auto-center.
--- messagemode / +menu_context default to T and G, which we want for
--- the layer toggles.
+-- Swallow conflicting binds: weapon-select scrolls, +reload (weapon
+-- animation+sound), and the default T/G binds (messagemode / +menu_context).
 hook.Add('PlayerBindPress', 'holo_table_3d.Controls', function(ply, bind, pressed)
     if not IsValid(controlled) then return end
     if bind == 'invnext' or bind == 'invprev' or bind == 'lastinv' then
@@ -393,6 +368,7 @@ hook.Add('PlayerBindPress', 'holo_table_3d.Controls', function(ply, bind, presse
     end
 end)
 
+--- Looks up the player's bound key for cmd, returning fallback when unbound.
 --- @param cmd string
 --- @param fallback string
 --- @return string
@@ -401,9 +377,7 @@ local function bindKey(cmd, fallback)
     return k and string.upper(k) or fallback
 end
 
--- Concatenates the player's bound keys for the four movement commands
--- (e.g. "WASD", "ESDF", "ARROWS"). Falls back to "WASD" when no bind
--- is found.
+--- @return string keys Concatenated bound keys for the four pan commands.
 local function panKeysHint()
     local f = bindKey('+forward', '?')
     local l = bindKey('+moveleft', '?')
@@ -443,8 +417,7 @@ hook.Add('HUDPaint', 'holo_table_3d.Controls', function()
         color_white, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
 end)
 
--- Manual release for users who walked away from the table and can't
--- reach it to press E again.
+-- Manual release for when the player walked away from the table.
 concommand.Add('holo_table_release', function()
     if not IsValid(controlled) then return end
     net.Start('holo_table_release')
@@ -452,9 +425,6 @@ concommand.Add('holo_table_release', function()
     net.SendToServer()
 end)
 
--- Snaps a holo table's scale/pan/height to frame the full BSP. Picks
--- the actively-controlled table, then the one under the crosshair,
--- then the nearest one. Also wired to +reload while controlling.
 concommand.Add('holo_table_autocenter', function()
     local ent = findControlTarget()
     if not IsValid(ent) then
@@ -471,9 +441,6 @@ concommand.Add('holo_table_autocenter', function()
             ent:GetScale(), ent:GetPanX(), ent:GetPanY(), ent:GetHeight()))
 end)
 
--- Snaps a holo table to the table's own map position at a close tactical
--- scale. Useful for watching players around the table without manually
--- scrolling in from the full-map fit every time.
 concommand.Add('holo_table_focus_table', function()
     local ent = findControlTarget()
     if not IsValid(ent) then

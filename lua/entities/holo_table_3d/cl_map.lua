@@ -1,6 +1,4 @@
--- Map subsystem: BSP clipping, map dressing, brush entities, props,
--- auto-centering, and profiling. The subsystem is split into ordinary
--- includes; shared internals live on ENT.MapCache.
+-- Map subsystem: ordered include shim. Shared internals live on ENT.MapCache.
 
 include('map/cl_map_shared.lua')
 include('map/cl_map_materials.lua')

@@ -59,6 +59,10 @@ function MapCache.destroyStaticPropPerPropBake()
     MapCache.staticPropPerPropBake = nil
 end
 
+--- Resolves a static-prop mesh material; returns nil for filtered or error mats.
+--- @param path string Material path.
+--- @return IMaterial? mat
+--- @return string? matKey Group key (basetexture name when present).
 local function staticPropBakeMaterial(path)
     if not path or path == '' then return nil, nil end
     local mat = Material(path)
@@ -68,6 +72,13 @@ local function staticPropBakeMaterial(path)
     return mat, btn and btn:GetName() or mat:GetName()
 end
 
+--- Transforms a model-local vert into BSP space and appends to out.
+--- @param out table Vertex list to append to.
+--- @param vert table { pos: Vector, normal?: Vector, u: number, v: number }
+--- @param origin Vector World origin of the prop.
+--- @param fx number @param fy number @param fz number Forward basis.
+--- @param rx number @param ry number @param rz number Right basis.
+--- @param ux number @param uy number @param uz number Up basis.
 local function addStaticPropBakeVert(out, vert, origin, fx, fy, fz, rx, ry, rz, ux, uy, uz)
     local pos = vert.pos
     local px, py, pz = pos.x, pos.y, pos.z
@@ -91,6 +102,9 @@ local function addStaticPropBakeVert(out, vert, origin, fx, fy, fz, rx, ry, rz, 
 end
 MapCache.addStaticPropBakeVert = addStaticPropBakeVert
 
+--- Kicks an async coroutine that bakes every BSP static prop into a global,
+--- material-batched IMesh list at the given scale.
+--- @param scale number Holo table scale this bake is built for.
 function MapCache.startStaticPropBake(scale)
     if not staticPropBakeCvar:GetBool() then return end
     local bsp = bsp2 and bsp2.GetCurrent()
@@ -250,6 +264,11 @@ function MapCache.startStaticPropBake(scale)
     end)
 end
 
+--- Per-prop variant of startStaticPropBake. Each prop becomes its own
+--- {center, radius, meshes} record so the draw path can sphere-cull
+--- before issuing each prop's mesh draws.
+--- @param scale number
+--- @see MapCache.startStaticPropBake
 function MapCache.startStaticPropPerPropBake(scale)
     if not staticPropBakeCvar:GetBool() then return end
     local bsp = bsp2 and bsp2.GetCurrent()
@@ -432,12 +451,12 @@ function MapCache.startStaticPropPerPropBake(scale)
     end)
 end
 
--- prop_dynamic map dressing is map-owned rather than radar-owned. Most of
--- it is static enough to bake into BSP-space IMeshes and draw inside the
--- holo matrix; the per-table csent fallback below covers partial views,
--- disabled bake, and the short window while a changed prop set rebuilds.
 
-
+--- Draws the active baked static-prop bake for the given holo table.
+--- Returns false on cache miss / scale mismatch / disabled bake; the caller
+--- then falls back to ENT:DrawStaticProps.
+--- @return boolean drewBake
+--- @see ENT:DrawStaticProps
 function ENT:DrawBakedStaticProps()
     if not staticPropBakeCvar:GetBool() then return false end
     if not self:GetMap() then return false end
@@ -525,57 +544,33 @@ function ENT:DrawBakedStaticProps()
     return true
 end
 
+--- Legacy fallback: per-prop ClientsideModel draws in world space, sphere-
+--- culled against the table cylinder. Used when bake is disabled / not
+--- ready. Allocation-free hot loop -- props cache scalar bases / cull centers.
+--- @see ENT:DrawBakedStaticProps
 function ENT:DrawStaticProps()
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.props then return end
     local selfTbl = self:GetTable()
 
-    -- Static props are drawn as clientside mirrors culled against the table
-    -- cylinder. Shared scratch position/angle objects keep this path
-    -- allocation-free per surviving prop.
-
-    -- Hot loop: 2256 props/frame on rp_venator, called every frame the
-    -- table is on screen. The earlier version allocated ~360 KB/frame of
-    -- short-lived Vectors (cull-pass arithmetic + per-prop LocalToWorld
-    -- results), which alone produced periodic 80 ms full-GC hitches.
-    -- This version unpacks every world vector into scalars up front so
-    -- the cull pass touches no garbage, and caches each prop's BSP-space
-    -- cull center as scalars on the prop itself the first time it is
-    -- considered.
     local axisX, axisY, axisZ = selfTbl._holoAxis:Unpack()
     local panX,  panY,  panZ  = selfTbl._holoPanHoriz:Unpack()
     local cylRadius   = selfTbl._holoCylRadius
     local floorOffset = selfTbl._holoFloorOffset
 
-    -- World-space transform mirroring the m2 matrix used for meshes:
-    --   p_world = tableOrigin + R(tableAng) * ((p_bsp - panOffset) / scale)
-    -- with the pan term already folded into tableOrigin (see
-    -- ENT:UpdateHologramTransform). Per-prop draw only needs the
-    -- standard scale + rotate, not the pan.
+    -- World-space transform mirrors m2: world = origin + R(tableAng) * (p_bsp / scale).
+    -- Pan is already folded into _holoOrigin.
     local tableAng    = selfTbl._holoAngles
     local tableOrigin = selfTbl._holoOrigin
     local invScale    = selfTbl._holoInvScale
 
-    -- Pre-multiply: prop survives sub-pixel cull when its visible
-    -- diagonal in holo units (2 * b.radius * invScale, since b.radius
-    -- is half-diagonal in BSP units) is >= PROP_SUBPIXEL_THRESHOLD.
-    -- Solve for b.radius: b.radius >= threshold / (2 * invScale).
     local subpxRadiusBSP = PROP_SUBPIXEL_THRESHOLD / (2 * invScale)
 
-    -- Pre-square the cylinder bound so the per-prop horiz check stays
-    -- in scalars (avoids the sqrt in :Length()).
-    local cylRadiusPlus = cylRadius -- per-prop adds b.radius below
+    local cylRadiusPlus = cylRadius
     local props = bsp.props
     local scratchPos = PROP_DRAW_SCRATCH_POS
     local scratchAng = PROP_DRAW_SCRATCH_ANG
 
-    -- Cache the table's basis vectors and origin as scalars once per
-    -- frame. Per-prop world position is then `tableOrigin + tF*lx -
-    -- tR*ly + tU*lz` (the verified Source/GMod LocalToWorld convention),
-    -- written into scratchPos via :SetUnpacked. The three :Forward()/
-    -- :Right()/:Up() calls each allocate a Vector but only run once per
-    -- frame, so the per-frame overhead is constant (~720 bytes/frame
-    -- regardless of prop count).
     local tF = tableAng:Forward()
     local tR = tableAng:Right()
     local tU = tableAng:Up()
@@ -595,21 +590,14 @@ function ENT:DrawStaticProps()
         if radius == 0 then continue end
         if radius < subpxRadiusBSP then continue end
 
-        -- BSP-space cull center and prop-local basis, lazily cached as
-        -- scalars on the prop. prop.origin and prop.angles never change
-        -- at runtime, so both the composed center and the prop's basis
-        -- are invariant. The two caches are independently gated so a
-        -- prop populated by an earlier build (before the basis fields
-        -- existed) still gets its basis filled the first time the
-        -- angled-prop draw path runs.
+        -- Lazily cached scalar cull center + prop basis. Both are
+        -- invariant since prop.origin/angles never change at runtime.
         local cx, cy, cz = prop._holoCullCx, prop._holoCullCy, prop._holoCullCz
         if not cx then
             local origin = prop.origin
             local bc = b.center
             local bcx, bcy, bcz = bc.x, bc.y, bc.z
             if prop.angles then
-                -- center = origin + R(prop.angles) * b.center
-                -- using the verified F*x - R*y + U*z convention.
                 local pf = prop.angles:Forward()
                 local pr = prop.angles:Right()
                 local pu = prop.angles:Up()
@@ -645,14 +633,6 @@ function ENT:DrawStaticProps()
         local cs = getPropDrawEnt(model)
         if not IsValid(cs) then continue end
 
-        -- Draw transform, written entirely into scratch storage.
-        -- Position: world = tableOrigin + R(tableAng) * (origin/scale).
-        -- Angles: tableAng directly when the prop has none of its own;
-        -- otherwise compose the world-space prop basis manually and
-        -- derive Euler angles into a scratch Angle. Verified to match
-        -- Matrix(SetAngles(tableAng):Rotate(prop.angles)):GetAngles()
-        -- to within 1e-6 across 80 cases (see PROP_DRAW_SCRATCH_ANG
-        -- doc-comment above). Zero allocations per drawn prop.
         local origin = prop.origin
         local lx = origin.x * invScale
         local ly = origin.y * invScale
@@ -663,11 +643,7 @@ function ENT:DrawStaticProps()
             toZ + tFz * lx - tRz * ly + tUz * lz)
         cs:SetPos(scratchPos)
         if prop.angles then
-            -- Compose the world-space basis vectors. Each composed
-            -- basis vector is R(tableAng) applied to the prop-local
-            -- basis using the same F*x - R*y + U*z convention used
-            -- for position. Only the components needed for Euler
-            -- extraction (full F, R.z, U.z) are computed.
+            -- Compose the world-space basis manually and derive Euler.
             local pfx, pfy, pfz = prop._holoFx, prop._holoFy, prop._holoFz
             local prx, pry, prz = prop._holoRx, prop._holoRy, prop._holoRz
             local pux, puy, puz = prop._holoUx, prop._holoUy, prop._holoUz
@@ -690,12 +666,6 @@ function ENT:DrawStaticProps()
     end
     render.SuppressEngineLighting(false)
 end
-
--- Replaces the live clipped mesh list, destroying the previous one. Records
--- whether the build was for an "all-in" cylinder; when it was, the list is
--- also cached on `self.AllInMeshes` so partial → all-in transitions can swap
--- it back in without rebuilding. Items are flagged `borrowed` while cached
--- so the standard DestroyClippedMap path won't free them.
 
 
 MapCache.staticPropBakeMaterial = staticPropBakeMaterial

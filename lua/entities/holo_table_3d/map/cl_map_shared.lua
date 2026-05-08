@@ -1,6 +1,4 @@
--- Shared state and utility helpers for the holo table map subsystem.
--- Files in this folder are ordinary includes; anything intentionally
--- shared between them lives on ENT.MapCache.
+-- Shared state for the map subsystem. Inter-file state lives on ENT.MapCache.
 
 local previousCleanup = _G.HOLO_TABLE_3D_CL_MAP_CLEANUP
 if type(previousCleanup) == 'function' then
@@ -13,17 +11,20 @@ ENT.MapCache = {}
 local MapCache = ENT.MapCache
 local MapCacheEntity = ENT
 
--- Shared scratch objects used by prop draw paths. They intentionally live
--- for the whole hot-load generation to avoid per-prop Vector/Angle garbage.
+-- Whole-generation scratch reused by every prop draw path.
 MapCache.PROP_DRAW_SCRATCH_POS = Vector()
 MapCache.PROP_DRAW_SCRATCH_ANG = Angle()
 
+--- Destroys a single mesh-bearing item, swallowing IMesh:Destroy errors.
+--- @param item table?
 function ENT:_SafeDestroyMesh(item)
     if not item or not item.mesh then return end
     pcall(item.mesh.Destroy, item.mesh)
     item.mesh = nil
 end
 
+--- Destroys every mesh in a list of {mat=..., mesh=IMesh} records.
+--- @param list table[]?
 function MapCache.destroyMeshList(list)
     if not list then return end
     for _, item in ipairs(list) do
@@ -31,6 +32,10 @@ function MapCache.destroyMeshList(list)
     end
 end
 
+--- Builds an IMesh from a flat triangle vertex list. Vertices are
+--- {pos=Vector, normal?=Vector, u?=number, v?=number, color?=Color}.
+--- @param verts table[]
+--- @return IMesh? mesh nil if fewer than 3 vertices.
 function MapCache.buildMeshFromTriangles(verts)
     local vertCount = #verts
     if vertCount < 3 then return nil end

@@ -36,6 +36,10 @@ end
 local DYNAMIC_PROP_MOVE_EPS_SQR = 1
 local DYNAMIC_PROP_ANGLE_EPS = 1
 
+--- True if a prop has moved / rotated / changed model or skin since last seen.
+--- @param a table? Previous snapshot record.
+--- @param b table Current snapshot record.
+--- @return boolean
 local function dynamicPropChanged(a, b)
     if not a then return false end
     if a.model ~= b.model or a.skin ~= b.skin then return false end
@@ -45,6 +49,10 @@ local function dynamicPropChanged(a, b)
         or da > DYNAMIC_PROP_ANGLE_EPS
 end
 
+--- Walks every prop_dynamic, marks movers as unbaked, and returns the
+--- bakeable subset plus a stable signature for change detection.
+--- @return table[] bakeList
+--- @return string signature
 local function dynamicPropSnapshot()
     local bake = MapCache.dynamicPropBake
     local prev = bake and bake.lastSeen or {}
@@ -94,6 +102,9 @@ local function dynamicPropSnapshot()
     return list, table.concat(sig, '|')
 end
 
+--- Kicks the bake coroutine for a given snapshot.
+--- @param snapshot table[]
+--- @param signature string
 local function startDynamicPropBake(snapshot, signature)
     if not MapCache.dynamicPropBake then return end
     MapCache.dynamicPropBake.state = 'building'
@@ -187,6 +198,8 @@ local function startDynamicPropBake(snapshot, signature)
     end)
 end
 
+--- 1 Hz watcher: rebuilds the prop_dynamic bake when the bakeable set
+--- (added / removed / reskinned / moved) changes. Movers stay on the fallback.
 function MapCache.startDynamicPropBakeWatch()
     if not dynamicPropBakeCvar:GetBool() then return end
     if MapCache.dynamicPropBake and MapCache.dynamicPropBake.gen == CACHE_GENERATION then return end
@@ -251,13 +264,9 @@ function MapCache.startDynamicPropBakeWatch()
 end
 
 
--- Builds per-material IMesh batches of the BSP geometry that survives
--- clipping against the holographic cylinder volume. The cylinder lives at
 local PROP_DRAW_SCRATCH_POS = MapCache.PROP_DRAW_SCRATCH_POS
 local PROP_DRAW_SCRATCH_ANG = MapCache.PROP_DRAW_SCRATCH_ANG
 
--- Hot-loop math locals: avoids per-call global table lookups in the
--- per-prop Euler-decomposition path.
 local atan2   = math_atan2
 local sin     = math_sin
 local cos     = math_cos
@@ -267,6 +276,10 @@ local RAD2DEG = 180 / math_pi
 
 local DYN_PROP_CACHE_TTL = 1.0
 
+--- Creates a NoDraw'd ClientsideProp for use as a per-table mirror of a
+--- prop_dynamic source entity.
+--- @param model string
+--- @return Entity?
 local function makeDynamicPropMirror(model)
     local cs = ents.CreateClientProp(model)
     if not IsValid(cs) then return nil end
@@ -294,6 +307,11 @@ function ENT:CleanupDynamicProps()
     selfTbl.DynamicPropMirrorTime = nil
 end
 
+--- Refreshes the per-table prop_dynamic mirror cache. With onlyUnbaked,
+--- keeps mirrors only for movers; the baked path covers the rest.
+--- @param self Entity
+--- @param onlyUnbaked boolean?
+--- @return table mirrors EntIndex -> { ent, csent, model }.
 local function refreshDynamicPropMirrors(self, onlyUnbaked)
     local selfTbl = self:GetTable()
     if selfTbl.DynamicPropMirrors and SysTime() - (selfTbl.DynamicPropMirrorTime or 0) < DYN_PROP_CACHE_TTL then
@@ -340,12 +358,11 @@ local function refreshDynamicPropMirrors(self, onlyUnbaked)
     return fresh
 end
 
--- Draws baked prop_dynamic map dressing inside the holo scene matrix.
--- The global GPU clip prism crops zoomed/partial views, so the baked path
--- can replace the per-prop ClientsideModel fallback outside all-in views too.
--- Returns true when the baked path handled the prop_dynamic layer this
--- frame, even if there are zero props; callers use this to skip the csent
--- fallback outside the matrix.
+--- Draws the baked prop_dynamic bake inside the holo scene matrix. Returns
+--- true while the baked path owns the layer (even with zero meshes) so the
+--- caller skips the csent fallback for stable props.
+--- @return boolean handled
+--- @see ENT:DrawDynamicProps
 function ENT:DrawBakedDynamicProps()
     if not dynamicPropBakeCvar:GetBool() then return false end
     if not self:GetMap() then return false end
@@ -375,10 +392,9 @@ function ENT:DrawBakedDynamicProps()
     return true
 end
 
--- Legacy prop_dynamic fallback. This mirrors the old radar module's
--- ClientsideModel path and is used for disabled bake or individual
--- moving/unbaked props. While the async map-owned bake is rebuilding, the
--- baked path suppresses this fallback for stable props.
+--- Per-table ClientsideProp fallback for unbaked / moving prop_dynamics.
+--- @param onlyUnbaked boolean? When the baked path handled the layer, restrict to movers.
+--- @see ENT:DrawBakedDynamicProps
 function ENT:DrawDynamicProps(onlyUnbaked)
     local mirrors = refreshDynamicPropMirrors(self, onlyUnbaked)
     if not mirrors then return end
@@ -432,8 +448,3 @@ function ENT:DrawDynamicProps(onlyUnbaked)
     end
     render.SuppressEngineLighting(false)
 end
-
--- Draws the shared baked static-prop mesh list. Returns true only when
--- it actually handled props this frame so cl_init can skip the legacy
--- per-prop ClientsideModel path. The caller has already pushed the holo
--- scene matrix and enabled the GPU clip prism.

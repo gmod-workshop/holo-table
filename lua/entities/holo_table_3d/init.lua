@@ -4,15 +4,10 @@ AddCSLuaFile('sh_controls.lua')
 AddCSLuaFile('cl_radar.lua')
 AddCSLuaFile('cl_map.lua')
 
--- cl_map.lua includes these map fragments in dependency order; ship all of
--- them to clients alongside the entity.
 for _, f in ipairs(file.Find('entities/holo_table_3d/map/*.lua', 'LUA')) do
     AddCSLuaFile('map/' .. f)
 end
 
--- Drop a .lua into entities/holo_table_3d/radar/ and the client picks
--- it up via cl_radar.lua's loader; this loop just makes sure each one
--- ships to clients.
 for _, f in ipairs(file.Find('entities/holo_table_3d/radar/*.lua', 'LUA')) do
     AddCSLuaFile('radar/' .. f)
 end
@@ -20,6 +15,8 @@ end
 include('shared.lua')
 include('sh_controls.lua')
 
+--- Server spawn: model + physics, hands off to the controls subsystem,
+--- seeds default view params.
 function ENT:Initialize()
     self:SetModel('models/kingpommes/starwars/venator/galaxy_holo_1.mdl')
     self:PhysicsInit(SOLID_VPHYSICS)

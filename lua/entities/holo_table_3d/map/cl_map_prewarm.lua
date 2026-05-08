@@ -14,16 +14,13 @@ local getMatByTexinfo = MapCache.getMatByTexinfo
 local resolveMat = MapCache.resolveMat
 local resolveProj = MapCache.resolveProj
 local getPropBounds = MapCache.getPropBounds
-local PREWARM_BUDGET_IDLE = 0.006 -- 6 ms per frame when nothing else is building
+local PREWARM_BUDGET_IDLE = 0.006
 local prewarmHookName      = 'holo_table_3d.tri_cache_prewarm'
 local prewarmCo            = nil
 local prewarmGen           = nil
 
--- Background coroutine that walks every worldspawn face once per
--- CACHE_GENERATION and populates `face._holoCull` and `face._holoTris`.
--- When no holo_table_3d has an active clip coroutine, it uses a generous
--- slice; otherwise it yields so the user-visible build wins.
-
+--- True if any holo_table_3d has an active build coroutine.
+--- @return boolean
 local function anyClipCoroutineActive()
     for _, e in ipairs(ents.FindByClass('holo_table_3d')) do
         if e.ClipCoroutine then return true end
@@ -32,6 +29,9 @@ local function anyClipCoroutineActive()
 end
 MapCache.anyClipCoroutineActive = anyClipCoroutineActive
 
+--- Background coroutine that walks every worldspawn face once per
+--- CACHE_GENERATION and populates face._holoCull / face._holoTris.
+--- Yields entirely while a user-visible build coroutine is running.
 function MapCache.startTriCachePrewarm()
     if not (bsp2 and bsp2.GetCurrent()) then return end
     if prewarmCo and prewarmGen == CACHE_GENERATION then return end
@@ -42,24 +42,16 @@ function MapCache.startTriCachePrewarm()
         local faces = bsp.models and bsp.models[1] and bsp.models[1].faces or bsp.faces
         if not faces then return end
         local nFaces = #faces
-        -- Shared deadline cell so the yieldable matByTexinfo builder
-        -- and the per-face loops below all observe the same budget
-        -- window and reset it consistently after each yield.
+        -- Shared cell so getMatByTexinfo and the per-face loops observe one budget window.
         local deadlineCell = { SysTime() + PREWARM_BUDGET_IDLE }
         local function deadlineFn() return deadlineCell[1] end
         local function bumpDeadline() deadlineCell[1] = SysTime() + PREWARM_BUDGET_IDLE end
 
-        -- Phase 0: build the texinfo->material lookup. Unavoidable
-        -- :GetName() call for every entry in the adapter material list, so
-        -- on big maps this is ~250 ms of work and would show up as a
-        -- single hitch if BuildClippedMap had to do it on the user's
-        -- first cold build. The yieldable variant spreads it over
-        -- multiple frames here.
+        -- Phase 0: spread the ~250 ms texinfo->material lookup over multiple frames.
         getMatByTexinfo(deadlineFn, bumpDeadline)
         bumpDeadline()
 
-        -- Phase 1: cull data for every face. Cheap, finishes in ~10
-        -- frames at 6 ms/frame even on rp_venator.
+        -- Phase 1: cull data for every face.
         for fi = 1, nFaces do
             if SysTime() > deadlineCell[1] then
                 coroutine_yield()
@@ -91,9 +83,7 @@ function MapCache.startTriCachePrewarm()
             face._holoCull = { cx = cx, cy = cy, cz = cz, fr = math_sqrt(r2max) }
         end
 
-        -- Phase 2: tri data for every face. Heavier; resolveMat does
-        -- material lookups (cached per tinfo) and the inner loop emits
-        -- the same per-vertex pos/normal/uv table the build path uses.
+        -- Phase 2: tri data; resolveMat is cached per tinfo.
         local matByTexinfo = getMatByTexinfo(deadlineFn, bumpDeadline) or {}
         for fi = 1, nFaces do
             if SysTime() > deadlineCell[1] then
@@ -151,8 +141,6 @@ function MapCache.startTriCachePrewarm()
             hook_Remove('Think', prewarmHookName)
             return
         end
-        -- Yield entirely while a user-visible build coroutine is
-        -- running so we never compete for the same ms.
         if anyClipCoroutineActive() then return end
 
         local ok, err = coroutine_resume(prewarmCo)
@@ -169,16 +157,13 @@ function MapCache.startTriCachePrewarm()
     end)
 end
 
--- Touches every unique static-prop model on the map exactly once via
--- getPropBounds, which forces the engine to load model metadata without
--- creating a throwaway clientside entity. Without this, those loads happen
--- lazily inside DrawStaticProps and produce 80-90 ms hitches the first
--- time the table renders a previously-unseen prop. Cheap enough (~110
--- unique models on a dense map at sub-millisecond per touch) that we
--- run it as a single coroutine with a small per-frame budget.
 local propPrewarmHookName = 'holo_table_3d.prop_prewarm'
 local propPrewarmCo       = nil
 local propPrewarmGen      = nil
+
+--- Touches every unique static-prop model once via getPropBounds. Without
+--- this, lazy model loads inside DrawStaticProps cause 80-90 ms hitches
+--- the first time a previously-unseen prop renders.
 function MapCache.startPropPrewarm()
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.props then return end
@@ -221,12 +206,6 @@ function MapCache.startPropPrewarm()
         end
     end)
 end
-
--- Shared static-prop bake. Static BSP props never move, so their model
--- triangles can be transformed into BSP space once and drawn under the
--- same holo scene matrix as the world mesh. Mode 3 keeps this global bake
--- active for zoomed views and lets the GPU clip prism trim it.
-
 
 function MapCache.cleanupPrewarm()
     hook_Remove('Think', prewarmHookName)

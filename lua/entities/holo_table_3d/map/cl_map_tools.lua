@@ -2,6 +2,12 @@ local math_sqrt = math.sqrt
 local math_max = math.max
 local math_ceil = math.ceil
 
+--- Fits the worldspawn AABB inside the cylinder. Pads the half-diagonal
+--- ~5%, lands the BSP floor 1 unit above the table top to avoid z-fighting.
+--- @return number? scale
+--- @return number? panX BSP X centroid.
+--- @return number? panY BSP Y centroid.
+--- @return number? height
 function ENT:ComputeAutoCenter()
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.models or not bsp.models[1] then return end
@@ -12,17 +18,11 @@ function ENT:ComputeAutoCenter()
     local halfDX = (m.maxs.x - m.mins.x) * 0.5
     local halfDY = (m.maxs.y - m.mins.y) * 0.5
 
-    -- Worst-case horizontal distance from the centroid is the AABB's
-    -- half-diagonal; pad ~5% so map geometry never sits flush against the
-    -- cylinder rim.
     local needRadius = math_sqrt(halfDX * halfDX + halfDY * halfDY) * 1.05
     local scale = math_max(1, math_ceil(needRadius / 90))
 
-    -- A BSP point at altitude P.z appears at world altitude
-    --   pivotZ + height + (P.z - pivotZ) / scale
-    -- Setting that equal to (pivotZ + 25 + clearance) for P.z = mins.z
-    -- (the lowest map face along the up axis) lands the floor on the
-    -- table top. clearance = 1 keeps it from z-fighting the floor clip.
+    -- Lands BSP mins.z (lowest map face along table-up) on the table top
+    -- plus 1 unit clearance to dodge the floor clip plane.
     local axis = self:GetUp()
     local pivotZ = self:GetPos():Dot(axis)
     local minsAlong = m.mins:Dot(axis)
@@ -34,9 +34,10 @@ end
 
 
 
--- Picks a target holo table for the auto-center command: prefers the
--- entity under the player's crosshair, falls back to the nearest one
--- in the world. Returns nil if no holo table exists.
+--- Picks a target holo table for the profiling concommand: crosshair entity,
+--- falling back to nearest. Distinct from sh_controls.findControlTarget
+--- so the dev tool stays decoupled from the control module.
+--- @return Entity?
 local function findAutoCenterTarget()
     local lp = LocalPlayer()
     if not IsValid(lp) then return end
@@ -54,14 +55,9 @@ local function findAutoCenterTarget()
     return best
 end
 
--- The `holo_table_autocenter` concommand lives in sh_controls.lua so
--- it can share the find-target helper with the +reload hotkey.
-
--- Synchronously runs BuildClippedMap with the entity's current params,
--- prints stage-by-stage timings + counts, and frees the temporary
--- meshes without touching the live ClippedMeshes. Useful for
--- benchmarking changes to the clipper without touching the live build
--- pipeline (no debounce, no coroutine yields).
+-- Synchronous BuildClippedMap with stage-by-stage timings; bypasses the
+-- coroutine and 150 ms debounce, frees its temporary meshes without
+-- touching the live build pipeline.
 concommand.Add('holo_table_profile', function()
     local ent = findAutoCenterTarget()
     if not IsValid(ent) then

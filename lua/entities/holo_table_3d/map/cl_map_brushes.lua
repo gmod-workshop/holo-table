@@ -29,9 +29,11 @@ end
 
 hook_Add('CurrentBSPReady', 'holo_table_3d.brushMeshCache', MapCache.clearBrushMeshCache)
 
--- Builds (or returns cached) per-material IMesh batches for a single brush
--- model. Vertices are kept in the model's local frame so a single mesh can
--- serve every live brush entity that references this bmodel index.
+--- Builds (or returns cached) per-material IMesh batches for one bmodel.
+--- Vertices are kept entity-local so a single mesh serves every live brush
+--- entity that references this bmodel index.
+--- @param modelIndex number 1-based bmodel index.
+--- @return table[]? meshes nil if the model has no renderable faces.
 function ENT:GetBrushModelMeshes(modelIndex)
     local cached = brushMeshCache[modelIndex]
     if cached ~= nil then return cached or nil end
@@ -56,9 +58,8 @@ function ENT:GetBrushModelMeshes(modelIndex)
 
         local mat = loadTexdataMaterial(tinfo.texdata.material)
         if mat:GetShader() == 'LightmappedGeneric' then
-            -- See BuildClippedMap.resolveMat: prefer the adapter fallback,
-            -- but wrap the corrected texture ourselves when that fallback
-            -- is broken.
+            -- Same logic as resolveMat: prefer the adapter fallback, wrap
+            -- the corrected texture ourselves when the fallback is broken.
             local fb = matByTexinfo[tostring(tinfo) .. '_texinfo']
             if fb then
                 local fbBtn = fb:GetTexture('$basetexture')
@@ -113,16 +114,13 @@ function ENT:GetBrushModelMeshes(modelIndex)
     return #list > 0 and list or nil
 end
 
--- Cached `*N` brush-entity list. The brush-ent set itself rarely
--- changes, so we filter once per second instead of once per frame.
--- The cache stores resolved bmodel index + pre-computed extent so the
--- per-frame loop can stay scalar. ents.Iterator walks the engine's
--- cached entity table directly (no fresh allocation), unlike
--- ents.GetAll which copies the C++ list back to Lua on every call.
+-- 1 Hz cached "*N" brush-entity list. ents.Iterator walks the engine's
+-- existing entity table directly (no realloc per call).
 local brushEntCache     = {}
 local brushEntCacheTime = 0
 local BRUSH_CACHE_TTL   = 1.0
---- @return {ent: Entity, idx1: number, extent: number}[]
+
+--- @return { ent: Entity, idx1: number, extent: number }[]
 local function getBrushEntList(bsp)
     if SysTime() - brushEntCacheTime < BRUSH_CACHE_TTL then return brushEntCache end
     local list = {}
@@ -146,15 +144,12 @@ local function getBrushEntList(bsp)
     return list
 end
 
--- Module-level scratch matrix reused for every brush-ent
--- cam.PushModelMatrix call (was a fresh Matrix per drawn ent).
+-- Module-level scratch matrix reused for every brush-ent push.
 local BRUSH_DRAW_SCRATCH_MTX = Matrix()
 
--- Draws every live brush entity ("*N" model) at its current world pose,
--- composed on top of the holo scene matrix that the caller has already
--- pushed (DrawBrushEntities pushes its own per-entity matrix with
--- multiply=true). Cylinder cull is done in BSP space using the entity's
--- live origin and bmodel local extent.
+--- Draws every live brush entity ("*N" model) at its current world pose,
+--- composed on top of the caller's pushed scene matrix. Cylinder cull is
+--- BSP-space scalar against the entity origin + bmodel local extent.
 function ENT:DrawBrushEntities()
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.models then return end
@@ -172,11 +167,6 @@ function ENT:DrawBrushEntities()
         local ent = rec.ent
         if not IsValid(ent) or ent == self then continue end
 
-        -- Cull in BSP-space scalars, no per-iteration Vector arithmetic.
-        -- entPos is one Vector allocation per frame per surviving ent
-        -- (Entity:GetPos returns a fresh Vector); cheaper than the four
-        -- Vectors the prior implementation built per ent for the same
-        -- result.
         local entPos = ent:GetPos()
         local px, py, pz = entPos.x, entPos.y, entPos.z
         local extent = rec.extent

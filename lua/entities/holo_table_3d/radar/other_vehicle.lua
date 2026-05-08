@@ -1,6 +1,7 @@
 -- Marker-sphere radar for non-LVS vehicles (LFS, simfphys, scars, etc).
--- No mirror prop; we just project the source position and draw a sphere.
 
+--- @param v Entity
+--- @return boolean
 local function isOtherVehicle(v)
     return v.LFS or v.IsSWVehicle or v.IsSWVRVehicle
 end

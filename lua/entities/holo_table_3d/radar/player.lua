@@ -1,8 +1,6 @@
--- Live player-model radar. Remote players use the same trick as wOS'
--- hologram table: draw the real player entity at a temporary projected
--- pose, then immediately restore it. The local player gets a small
--- ClientsideModel mirror because first-person local-player drawing is
--- special-cased by the engine and may be suppressed.
+-- Live player-model radar. Remote players: temporarily move the real entity
+-- to the projected pose for one DrawModel call. Local player: ClientsideModel
+-- mirror because first-person local-player drawing is engine-suppressed.
 
 local mirrorState = _G.HOLO_TABLE_3D_PLAYER_RADAR_MIRRORS
 if mirrorState then
@@ -39,6 +37,8 @@ local function drawPlayerAndWeapon(ply)
     end
 end
 
+--- Detaches and removes a mirror record's csent.
+--- @param mirror table?
 local function removeMirror(mirror)
     if not mirror then return end
     local cs = mirror.csent
@@ -58,15 +58,17 @@ local function setupMirrorEntity(cs)
     mirrorState[cs] = true
 end
 
+--- Builds the local player's mirror, including a GetPlayerColor proxy so
+--- player-color materials sample from the source player.
+--- @param ply Player
+--- @param model string
+--- @return table? mirror
 local function makePlayerMirror(ply, model)
     local cs = ClientsideModel(model, RENDERGROUP_OTHER)
     if not IsValid(cs) then return nil end
 
     setupMirrorEntity(cs)
 
-    -- Player-color proxies on many playermodel materials ask the entity
-    -- being drawn for GetPlayerColor, so let the mirror answer with the
-    -- source player's live color.
     cs.GetPlayerColor = function()
         if IsValid(ply) then return ply:GetPlayerColor() end
         return vector_origin
@@ -75,6 +77,8 @@ local function makePlayerMirror(ply, model)
     return { csent = cs, model = model }
 end
 
+--- @param model string
+--- @return table?
 local function makeWeaponMirror(model)
     local cs = ClientsideModel(model, RENDERGROUP_OTHER)
     if not IsValid(cs) then return nil end
@@ -84,6 +88,10 @@ local function makeWeaponMirror(model)
     return { csent = cs, model = model }
 end
 
+--- Returns / lazily rebuilds the local-player mirror when the player model changes.
+--- @param radar table
+--- @param ply Player
+--- @return table?
 local function getLocalMirror(radar, ply)
     local model = ply:GetModel()
     if not model or model == '' then return nil end
@@ -121,6 +129,10 @@ local function validModelName(model)
     return isstring(model) and model ~= ''
 end
 
+--- Best-effort world model lookup for a weapon: live model -> WorldModel ->
+--- weapons.Get -> list.Get('Weapon') -> stock fallback -> view model -> ViewModel.
+--- @param wep Weapon
+--- @return string?
 local function getWeaponModel(wep)
     local model = wep:GetModel()
     if validModelName(model) then return model end
@@ -153,6 +165,9 @@ local function getWeaponModel(wep)
     return nil
 end
 
+--- @param radar table
+--- @param wep Weapon?
+--- @return table?
 local function getLocalWeaponMirror(radar, wep)
     if not IsValid(wep) then
         removeMirror(radar.LocalWeaponMirror)
@@ -218,6 +233,11 @@ local LOCAL_BONE_MTX = Matrix()
 local TARGET_BONE_MTX = Matrix()
 local BONE_SCALE_VEC = Vector()
 
+--- Returns the cached list of mirror bone IDs that are valid on both
+--- source and mirror; rebuilt when bone counts change.
+--- @param ply Player
+--- @param mirror table
+--- @return number[]
 local function getMirrorBoneIds(ply, mirror)
     local cs = mirror.csent
     local plyBoneCount = ply:GetBoneCount() or 0
@@ -242,6 +262,14 @@ local function getMirrorBoneIds(ply, mirror)
     return ids
 end
 
+--- Copies LocalPlayer()'s solved bone matrices onto the mirror at the
+--- projected root pose. Handles attack / reload animations that
+--- BaseAnimating layer APIs can't drive on a ClientsideModel.
+--- @param ply Player
+--- @param mirror table
+--- @param rootPos Vector
+--- @param rootAng Angle
+--- @param invScale number
 local function copyLocalBonePose(ply, mirror, rootPos, rootAng, invScale)
     if not localBonePoseCvar:GetBool() then return end
 
@@ -335,6 +363,8 @@ local function canBoneMergeWeapon(weaponCs)
     return false
 end
 
+--- Bone-merges the weapon mirror onto the player mirror, falling back to an
+--- attachment when bone-merge isn't viable.
 local function attachWeaponMirror(playerMirror, weaponCs)
     clearWeaponParent(weaponCs)
     weaponCs:SetPos(playerMirror:GetPos())
@@ -355,6 +385,9 @@ local function attachWeaponMirror(playerMirror, weaponCs)
     end
 end
 
+--- @param radar table
+--- @param ply Player
+--- @param invScale number
 local function drawProjectedLocalPlayer(radar, ply, invScale)
     local mirror = getLocalMirror(radar, ply)
     if not mirror then return end
@@ -390,6 +423,11 @@ local function drawProjectedLocalPlayer(radar, ply, invScale)
     end
 end
 
+--- Remote-player path: temporarily move the real entity to the projected
+--- pose, draw, restore. wOS-style trick.
+--- @param radar table
+--- @param ply Player
+--- @param invScale number
 local function drawProjectedPlayer(radar, ply, invScale)
     local oldPos = ply:GetPos()
     local oldAng = ply:GetAngles()

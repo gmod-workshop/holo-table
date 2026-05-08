@@ -4,8 +4,7 @@ if not ok then
     return
 end
 
--- NikNaks-backed BSP adapter. This preserves the small bsp2 surface that
--- holo_table_3d consumes while dropping the old vendored BSP parser.
+-- NikNaks-backed adapter preserving the small bsp2 surface holo_table_3d uses.
 bsp2 = bsp2 or {}
 
 local SCALE = 1
@@ -13,11 +12,16 @@ local SCALE = 1
 local CURRENT
 local CACHE_GENERATION = SysTime()
 
+--- @return table? map NikNaks map handle, or nil with an error string.
+--- @return string? err
 local function ensureNikNaksMap()
     if not NikNaks then return nil, 'NikNaks is not loaded' end
     return NikNaks.CurrentMap or NikNaks.Map()
 end
 
+--- Returns table values ordered by ascending numeric key.
+--- @param t table?
+--- @return any[]
 local function orderedValues(t)
     local keys = {}
     for k in pairs(t or {}) do
@@ -32,6 +36,10 @@ local function orderedValues(t)
     return out
 end
 
+--- Adapts a NikNaks texinfo into the legacy bsp2 shape, gen-cached on the source.
+--- @param map table
+--- @param src table?
+--- @return table?
 local function adaptTexInfo(map, src)
     if not src then return nil end
     if src._holoBsp2TexInfo and src._holoBsp2Gen == CACHE_GENERATION then
@@ -62,6 +70,10 @@ local function adaptTexInfo(map, src)
     return out
 end
 
+--- Adapts a NikNaks face into a legacy bsp2 face with explicit vertex pairs.
+--- @param map table
+--- @param src table?
+--- @return table?
 local function adaptFace(map, src)
     if not src then return nil end
     if src._holoBsp2Face and src._holoBsp2Gen == CACHE_GENERATION then
@@ -88,6 +100,9 @@ local function adaptFace(map, src)
     return out
 end
 
+--- @param map table
+--- @param src table?
+--- @return table?
 local function adaptModel(map, src)
     if not src then return nil end
     if src._holoBsp2Model and src._holoBsp2Gen == CACHE_GENERATION then
@@ -111,6 +126,8 @@ local function adaptModel(map, src)
     return out
 end
 
+--- @param src table NikNaks static prop.
+--- @return { model: string, origin: Vector, angles: Angle, skin: number }
 local function adaptStaticProp(src)
     return {
         model = src:GetModel(),
@@ -120,6 +137,9 @@ local function adaptStaticProp(src)
     }
 end
 
+--- Materializes the current map's adapted view: worldspawn at models[1],
+--- bmodels at models[2..], plus static props.
+--- @return table?
 local function buildCurrent()
     local map, mapErr = ensureNikNaksMap()
     if not map then
@@ -146,8 +166,7 @@ local function buildCurrent()
     end
 
     CURRENT = {
-        -- `faces` is kept as the legacy world-face fallback/guard used
-        -- by cl_map.lua; model 1 is the canonical worldspawn source.
+        -- Legacy world-face fallback used by cl_map.lua; canonical source is models[1].
         faces = models[1].faces,
         models = models,
         props = props,
@@ -156,6 +175,7 @@ local function buildCurrent()
     return CURRENT
 end
 
+--- @return table?
 function bsp2.GetCurrent()
     return CURRENT or buildCurrent()
 end
@@ -169,6 +189,9 @@ if CLIENT then
         MATERIALS_READY = false
     end
 
+    --- Returns the per-texinfo UnlitGeneric fallback material, cached on the texinfo.
+    --- @param tinfo table
+    --- @return IMaterial
     local function materialForTexInfo(tinfo)
         if tinfo._holoBsp2Material then return tinfo._holoBsp2Material end
 
@@ -187,16 +210,15 @@ if CLIENT then
         return mat
     end
 
+    --- Builds the per-texinfo fallback material list and runs CurrentBSPReady.
+    --- cl_map.lua owns all visible rendering; the only contract here is the
+    --- material list keyed by 'tostring(tinfo) .. _texinfo'.
     local function buildModelInfo()
         destroyModelInfo()
 
         local map = ensureNikNaksMap()
         if not map then return end
 
-        -- cl_map.lua owns all visible world/prop rendering now. The
-        -- remaining GetModelInfo contract it needs is the per-texinfo
-        -- UnlitGeneric fallback material list, keyed by material name
-        -- (`tostring(tinfo) .. '_texinfo'`).
         local texinfos = orderedValues(map:GetTexInfo())
         for i = 1, #texinfos do
             MATERIALS[#MATERIALS + 1] = materialForTexInfo(adaptTexInfo(map, texinfos[i]))
@@ -214,6 +236,7 @@ if CLIENT then
             #MATERIALS))
     end
 
+    --- @return { meshes: table[], materials: IMaterial[], entities: table[], scale: number }?
     function bsp2.GetModelInfo()
         if not MATERIALS_READY then buildModelInfo() end
         if not MATERIALS_READY then return nil end

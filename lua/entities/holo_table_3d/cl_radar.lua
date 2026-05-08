@@ -1,51 +1,44 @@
--- Radar subsystem: a tiny module loader plus ENT lifecycle hooks that
--- iterate the registered modules. Drop a file in
--- entities/holo_table_3d/radar/ that defines RADAR:Initialize/Think/
--- Draw/OnRemove (any subset) and it gets picked up here.
---
--- Public surface on ENT: InitializeRadar, ThinkRadar, DrawRadar,
--- CleanupRadar -- wired from cl_init.lua's Initialize/Think/OnRemove
--- and DrawHologram.
+-- Radar subsystem: module loader + ENT lifecycle hooks. Drop a file in
+-- entities/holo_table_3d/radar/ defining RADAR:Initialize/Think/Draw/OnRemove.
 
--- Methods inherited by every module's RADAR table, and through it by
--- every per-entity instance. GetScale returns the *inverse* scale (the
--- factor the modules actually want when drawing into the table) since
--- no module has wanted the forward direction yet. All accessors read
--- the shared hologram transform staged on the entity by
--- ENT:UpdateHologramTransform (cl_init.lua) once per frame.
+--- @class RadarBase
+--- @field entity Entity Owning holo_table_3d.
+--- @field entityTable table Cached self:GetTable() of the owning entity.
+--- Base inherited by every radar module. Per-entity instances see
+--- self = inst -> mod -> RadarBase, so module bodies have these accessors.
 local RadarBase = {}
 RadarBase.__index = RadarBase
 
---- @return Entity
+--- @return Entity table The owning holo_table_3d entity.
 function RadarBase:GetEntity() return self.entity end
---- @return number
+
+--- @return number invScale Inverse of the table's Scale; multiply BSP-space lengths by this.
 function RadarBase:GetScale()  return self.entityTable._holoInvScale end
---- @return Vector
+
+--- @return Vector world Hologram origin in world space (current frame).
 function RadarBase:GetOrigin() return self.entityTable._holoOrigin end
---- @return Angle
+
+--- @return Angle world Hologram angles in world space (current frame).
 function RadarBase:GetAngles() return self.entityTable._holoAngles end
 
--- Hot-loop math locals; module-level scratch Vector/Angle are reused
--- across every Project call so the per-entry allocation drops from
--- (1 Vec + 1 Vec + 1 Ang for pos*invScale and the LocalToWorld returns)
--- to zero. Lifetime contract: the returned Vector/Angle are valid only
--- until the next Project call on any radar instance. Every consumer in
--- this addon reads them immediately (csent:SetPos(wpos); csent:Set-
--- Angles(wang); render.DrawSphere(self:Project(...))) so the contract
--- holds.
 local atan2, sqrt = math.atan2, math.sqrt
 local cos, sin    = math.cos, math.sin
 local DEG2RAD     = math.pi / 180
 local RAD2DEG     = 180 / math.pi
+
+-- Module-level scratch reused across every Project call. Lifetime contract:
+-- the returned Vector/Angle are valid only until the next Project on any
+-- radar instance; every consumer reads them immediately.
 local PROJ_POS    = Vector()
 local PROJ_ANG    = Angle()
 
--- Maps a BSP-space (pos, ang) into the hologram's world-space slot.
--- Only valid inside a module's Draw (the _holo* fields are staged for
--- the current frame by then). Math: world = O + R(tableAng) * (pos *
--- invScale), composed angle = R(tableAng) * R(ang) decomposed back to
--- Euler. Verified to match LocalToWorld(pos*inv, ang, _holoOrigin,
--- _holoAngles) within ~1e-5 across diverse cases.
+--- Maps a BSP-space (pos, ang) into the hologram's world-space slot.
+--- Only valid inside a module's Draw (the _holo* fields are staged for the
+--- current frame by then). Returns shared scratch -- read immediately.
+--- @param pos Vector BSP-space position.
+--- @param ang Angle? BSP-space angles (optional).
+--- @return Vector worldPos
+--- @return Angle? worldAng
 function RadarBase:Project(pos, ang)
     local e   = self.entityTable
     local s   = e._holoInvScale
@@ -59,8 +52,7 @@ function RadarBase:Project(pos, ang)
         e._holoOz + tFz * lx - tRz * ly + tUz * lz)
     if not ang then return PROJ_POS end
 
-    -- Build the input angle's basis directly from cos/sin (no Vector
-    -- allocs from Angle:Forward/Right/Up). Source mathlib convention.
+    -- Build the input angle's basis directly from cos/sin (Source mathlib).
     local sp, cp = sin(ang.p * DEG2RAD), cos(ang.p * DEG2RAD)
     local sy, cy = sin(ang.y * DEG2RAD), cos(ang.y * DEG2RAD)
     local sr, cr = sin(ang.r * DEG2RAD), cos(ang.r * DEG2RAD)
@@ -68,8 +60,7 @@ function RadarBase:Project(pos, ang)
     local pRx, pRy, pRz = -sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp
     local pUx, pUy, pUz =  cr * sp * cy + sr * sy,  cr * sp * sy - sr * cy,  cr * cp
 
-    -- Compose with the table basis (only the components needed for
-    -- Euler extraction: full F, plus R.z and U.z).
+    -- Compose with the table basis; only the components needed for Euler.
     local wFx = tFx * pFx - tRx * pFy + tUx * pFz
     local wFy = tFy * pFx - tRy * pFy + tUy * pFz
     local wFz = tFz * pFx - tRz * pFy + tUz * pFz
@@ -82,16 +73,13 @@ function RadarBase:Project(pos, ang)
     return PROJ_POS, PROJ_ANG
 end
 
--- Module registry. Each entry is the RADAR table populated by a file
--- in radar/, with __index chaining to RadarBase.
 local registry = {}
 
+--- Walks radar/*.lua, sets _G.RADAR to a fresh per-module table chained to
+--- RadarBase, includes the file, and pushes the populated module onto the registry.
 local function loadModules()
     registry = {}
     for _, fname in ipairs(file.Find('entities/holo_table_3d/radar/*.lua', 'LUA')) do
-        -- mod inherits from RadarBase (via RadarBase.__index = RadarBase)
-        -- and is itself the metatable for per-entity instances, so the
-        -- lookup chain is inst -> mod -> RadarBase.
         local mod = setmetatable({}, RadarBase)
         mod.__index = mod
         _G.RADAR = mod
@@ -109,9 +97,8 @@ end
 
 loadModules()
 
--- Builds one instance per registered module; instance lookup is
--- inst -> RADAR -> RadarBase, so modules see a `self` that has both
--- their own methods and the base accessors.
+--- Builds one instance per registered module on self.Radars.
+--- Lookup chain is inst -> mod -> RadarBase.
 function ENT:InitializeRadar()
     local selfTbl = self:GetTable()
     selfTbl.Radars = {}
@@ -122,6 +109,8 @@ function ENT:InitializeRadar()
     end
 end
 
+--- Iterates every module's Think. Lazy-inits if Radars is missing so live
+--- reload against an already-spawned entity doesn't crash.
 function ENT:ThinkRadar()
     local selfTbl = self:GetTable()
     if not selfTbl.Radars then self:InitializeRadar() end
@@ -130,11 +119,10 @@ function ENT:ThinkRadar()
     end
 end
 
--- Iterates every module's Draw. Runs outside the m2 matrix block in
--- DrawHologram because Entity:DrawModel ignores cam matrices; modules
--- read the shared hologram transform via RadarBase accessors, which
--- pull from self._holo* (staged once per frame by
--- ENT:UpdateHologramTransform in cl_init.lua).
+--- Iterates every module's Draw. Runs outside the m2 matrix block in
+--- DrawHologram because Entity:DrawModel ignores cam matrices.
+--- @see ENT:DrawHologram
+--- @see RadarBase.Project
 function ENT:DrawRadar()
     local radars = self:GetTable().Radars
     if not radars then return end

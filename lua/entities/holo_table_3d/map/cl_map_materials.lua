@@ -4,15 +4,15 @@ local Vector = Vector
 local Material = Material
 local bit_band = bit.band
 local coroutine_yield = coroutine.yield
+
+-- Materials whose $basetexture identifies an unrenderable surface.
 local filter = {
     ['color/white'] = true,
     ['error'] = true
 }
 
--- Per-model bounding-sphere {center, radius} in model-local space, plus
--- reusable ClientsideModel draw entities for the legacy fallback path.
--- Shared across all holo_table_3d entities; entries are populated lazily
--- on first use and live until hot-reload cleanup.
+-- Per-model {center, radius} bounding spheres + reusable ClientsideModel
+-- draw entities for the legacy fallback path. Hot-reload-lifetime.
 local propBoundsCache = {}
 local propEntCache = {}
 
@@ -23,13 +23,13 @@ local staticPropBakeModeCvar = CreateClientConVar('holo_table_staticprop_bake_mo
 local dynamicPropBakeCvar = CreateClientConVar('holo_table_dynamicprop_bake', '1', true, false,
     'Use baked prop_dynamic meshes for holo table views.')
 
--- Sub-pixel cull threshold in holo units (table-local space). At typical
--- viewing distances 1 holo unit ≈ 2 screen pixels, so 0.5 ≈ 1 px. Any
--- prop whose post-scale diagonal falls below this is too small to be
--- visually significant and can be skipped. Shared by the legacy prop
--- renderer and the scale-specific baked all-in renderer.
+-- Sub-pixel cull threshold in holo units (0.5 ≈ 1 px at typical viewing).
 local PROP_SUBPIXEL_THRESHOLD = 0.5
 
+--- Fetches (and caches) a model's bounding sphere. Falls back to a
+--- ClientsideModel when util.GetModelInfo doesn't return hull bounds.
+--- @param name string Model path.
+--- @return { center: Vector, radius: number }
 local function getPropBounds(name)
     local b = propBoundsCache[name]
     if b then return b end
@@ -58,6 +58,9 @@ local function getPropBounds(name)
     return b
 end
 
+--- Returns a cached, NoDraw'd ClientsideModel for legacy per-prop draws.
+--- @param name string Model path.
+--- @return Entity?
 local function getPropDrawEnt(name)
     local cs = propEntCache[name]
     if IsValid(cs) then return cs end
@@ -78,15 +81,18 @@ local function cleanupPropEntCache()
     propBoundsCache = {}
 end
 
--- Sutherland–Hodgman clip of a convex polygon against the half-space
--- `pos:Dot(n) <= d`. Returns the input poly unchanged when every vertex
--- already satisfies the half-space (Common Halfspace trivial-accept), the
--- shared `clipEmptyPoly` when every vertex is outside, otherwise a fresh
--- list. Inputs are left untouched. The distance scan is performed once
--- into `clipDistScratch` so the clip pass below can reuse it without
--- recomputing dot products.
+-- Sutherland-Hodgman clip scratch. Distance scan is hoisted into
+-- clipDistScratch so the clip loop can read it directly.
 local clipDistScratch = {}
 local clipEmptyPoly = {}
+
+--- Clips a convex polygon against the half-space pos:Dot(n) <= d.
+--- Returns the input poly when every vertex is already inside,
+--- a shared empty list when every vertex is outside, otherwise a fresh list.
+--- @param poly Vector[]
+--- @param n Vector Plane normal.
+--- @param d number Plane offset.
+--- @return Vector[]
 local function clipPolygonPlane(poly, n, d)
     local count = #poly
     if count == 0 then return poly end
@@ -136,10 +142,10 @@ end
 -- Surface flags we never want to render (sky, nodraw, skip).
 local SURF_SKIP_MASK = bit.bor(0x2, 0x4, 0x80, 0x200)
 
--- Some BSP texdata entries store the material with a stray leading slash
--- (e.g. "/FIRSTORDERBANNER"); Material() returns the error material on
--- those and the resulting "error" basetexture gets dropped by `filter`,
--- silently hiding those brush faces. Strip the slash and retry.
+--- Loads a texdata material, retrying with the leading slash stripped
+--- on the error path; some BSPs ship paths like "/FIRSTORDERBANNER".
+--- @param name string
+--- @return IMaterial
 local function loadTexdataMaterial(name)
     local m = Material(name)
     if m:IsError() and name:sub(1, 1) == '/' then
@@ -148,22 +154,19 @@ local function loadTexdataMaterial(name)
     return m
 end
 
--- MaterialVarFlags bits we care about propagating from the source
--- LightmappedGeneric onto the holo wrapper. Source materials that set
--- these (commonly via the engine auto-detecting alpha in the .vtf, not
--- via an explicit $translucent/$alphatest VMT key) need the flag carried
--- across or transparent textures (glass, fences, foliage) come through
--- as solid black: their RGB usually only encodes a tint/reflection and
--- the actual transparency lives in the alpha channel.
+-- MaterialVarFlags bits propagated from source LightmappedGeneric onto the
+-- holo wrapper so glass / fences / foliage render with their alpha intact.
 local MATFLAG_ALPHATEST   = 0x100
 local MATFLAG_TRANSLUCENT = 0x200000
 
--- Wraps `src`'s $basetexture in a runtime UnlitGeneric so the holo pass can
--- render it without a lightmap. Used when the adapter-generated fallback for
--- a given texinfo carries the error texture (typically because the BSP
--- texdata path was malformed), and to rebuild a translucent/alphatest
--- variant when the generated UnlitGeneric drops those flags.
 local unlitWrapCache = {}
+
+--- Wraps src's $basetexture in a runtime UnlitGeneric so the holo can
+--- render it without a lightmap. Cached per (basetexture, alpha-flags).
+--- @param src IMaterial
+--- @param translucent boolean?
+--- @param alphaTest boolean?
+--- @return IMaterial
 local function unlitWrap(src, translucent, alphaTest)
     local btn = src:GetTexture('$basetexture')
     if not btn then return src end
@@ -185,22 +188,14 @@ local function unlitWrap(src, translucent, alphaTest)
     return m
 end
 
--- How long a single coroutine.resume of the async build is allowed to run
--- before yielding back to the main thread.
+-- Per coroutine.resume budget for the async build.
 local CLIP_FRAME_BUDGET = 0.004
 
--- Bumped on every file load so per-face triangulation caches
--- (`face._holoTris`) that hold resolved material refs are invalidated
--- when this file is hot-reloaded; otherwise material-resolution code
--- changes only take effect on the next map load. SysTime() is unique
--- per load and cheap.
+-- Bumped on every file load so per-face triangulation caches that hold
+-- resolved material refs are invalidated on hot reload.
 local CACHE_GENERATION = SysTime()
 
--- Per-tinfo caches (resolved material, skip flag, unpacked textureVecs)
--- shared by BuildClippedMap and the background tri-cache prewarm. Keyed
--- by tinfo identity, gen-stamped against CACHE_GENERATION so a hot
--- reload purges them lazily on next access.
---- @type { gen: number, [Face]: IMaterial }
+-- Per-tinfo caches gen-stamped for lazy purge on hot reload.
 local matCacheGlobal     = { gen = CACHE_GENERATION }
 local skipCacheGlobal    = { gen = CACHE_GENERATION }
 local projCacheGlobal    = { gen = CACHE_GENERATION }
@@ -212,6 +207,13 @@ local function checkCacheGen()
     end
 end
 
+--- Resolves the holo-pass material for a texinfo. LightmappedGeneric sources
+--- get an UnlitGeneric replacement; alpha flags are preserved. See DESIGN.md
+--- "Material handling".
+--- @param tinfo table
+--- @param matByTexinfo table<string, IMaterial>
+--- @return IMaterial mat
+--- @return boolean skip True if the material's basetexture is in the filter set.
 local function resolveMat(tinfo, matByTexinfo)
     checkCacheGen()
     local m = matCacheGlobal[tinfo]
@@ -239,6 +241,9 @@ local function resolveMat(tinfo, matByTexinfo)
     return m, skip
 end
 
+--- Caches unpacked textureVecs / inverse texdata size for a texinfo.
+--- @param tinfo table
+--- @return { sv: Vector, sw: number, tv: Vector, tw: number, invW: number, invH: number }
 local function resolveProj(tinfo)
     checkCacheGen()
     local p = projCacheGlobal[tinfo]
@@ -254,23 +259,16 @@ local function resolveProj(tinfo)
     return p
 end
 
--- The NikNaks adapter emits one UnlitGeneric material per texinfo (named
--- `<tinfo>_texinfo`) and exposes them via mi.materials. We need a
--- name->material lookup to fall back from LightmappedGeneric world
--- materials. Building that lookup is
--- O(materials) and on big maps (rp_venator: 5934 entries) costs ~250 ms --
--- entirely in :GetName() calls into engine code, so we can't avoid the work,
--- only chunk it. Cache is keyed by the mi.materials table identity so
--- rebuilds only happen when the adapter swaps the list.
---
--- When called from a coroutine context (the user-visible build path or
--- the prewarm), the build is yieldable: pass `deadlineFn`/`bumpFn` and
--- the loop yields whenever the current frame budget is exhausted.
--- When called outside a coroutine (no callbacks), the work runs
--- synchronously and shows up as a single-frame hitch -- callers in the
--- hot path always wrap it.
+-- name -> IMaterial lookup over mi.materials. Cached by table identity
+-- because the rebuild costs ~250 ms on Venator (5934 entries). Yields
+-- when a deadline callback is provided.
 local matByTexinfoCache = nil
 local matByTexinfoSrc = nil
+
+--- Returns a name->IMaterial lookup over the adapter's mi.materials list.
+--- @param deadlineFn? fun(): number Returns SysTime deadline; yields when exceeded.
+--- @param bumpFn? fun() Called after each yield to refresh the deadline.
+--- @return table<string, IMaterial>?
 local function getMatByTexinfo(deadlineFn, bumpFn)
     local mi = bsp2 and bsp2.GetModelInfo()
     local mats = mi and mi.materials
