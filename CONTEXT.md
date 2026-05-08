@@ -242,12 +242,12 @@ entities, static props, radar markers, and players are GPU-clipped via a
 19. `prop_dynamic` map dressing moved out of radar. The radar module is
     now a stub so loader/AddCSLuaFile behaviour stays stable, while
     `map/cl_map_dynamic_props.lua` owns `prop_dynamic` as map dressing:
-    an async baked IMesh path for horizontally all-in views, a 1-second
-    watcher that detects added/removed/moved/reskinned props and rebuilds,
-    and a legacy per-table csent fallback for disabled bake, partial
-    views, or individual moving/rotating props. All-in bake rebuild
-    windows suppress the fallback instead of creating temporary mirror
-    props.
+    an async baked IMesh path drawn inside the holo matrix and cropped by
+    the existing GPU clip prism in both all-in and partial views, a
+    1-second watcher that detects added/removed/moved/reskinned props and
+    rebuilds, and a legacy per-table csent fallback for disabled bake or
+    individual moving/rotating props. Bake rebuild windows suppress the
+    stable-prop fallback instead of creating temporary mirror props.
     Venator's moving `hypertunnel.mdl` exposed why movers must be
     excluded from the bake instead of forcing a rebuild every watcher
     tick. Toggle with `holo_table_dynamicprop_bake`.
@@ -286,8 +286,9 @@ entities, static props, radar markers, and players are GPU-clipped via a
     `ClientsideModel` / `ents.CreateClientProp` makes the engine parse
     those bad blocks; `util.GetModelMeshes` and `util.GetModelInfo` do
     not spam by themselves. The current mitigation avoids clientside
-    entity creation during static-prop prewarm and suppresses the
-    all-in `prop_dynamic` fallback while the bake is building.
+    entity creation during static-prop prewarm and uses the baked
+    `prop_dynamic` path for stable map dressing instead of steady
+    clientside mirror props.
 25. Hot-reload cleanup. `cl_map.lua` registers
     `_G.HOLO_TABLE_3D_CL_MAP_CLEANUP` and runs the previous generation's
     cleanup at file load. This tears down shared static/dynamic prop
@@ -354,6 +355,45 @@ entities, static props, radar markers, and players are GPU-clipped via a
     `ents.FindByClass('holo_table_3d')` was ~55.8 ms total
     (~27.9 us/call). A busy class (`beam`, 275 ents) still favored
     `FindByClass` (~71.1 ms vs ~119.5 ms).
+32. Static IMesh construction switched from `IMesh:BuildFromTriangles`
+    to `mesh.Begin(msh, MATERIAL_TRIANGLES, triCount)` via
+    `MapCache.buildMeshFromTriangles`. Wiki docs confirm
+    `mesh.Begin(IMesh, primitiveType, primitiveCount)` and note the
+    static mesh vertex limit; current chunks stay below it. On
+    `holo_table_profile` with the same table/map, warm map build timings
+    dropped from roughly 83-92 ms total (75-84 ms imesh phase) to
+    roughly 30-32 ms total (21-22 ms imesh phase).
+33. Player radar local mirror bone-copy path optimized. The local player
+    mirror now caches valid bone IDs and uses reusable matrices plus
+    `Entity:CopyBoneMatrix` when available, instead of allocating fresh
+    matrices / `WorldToLocal` / `LocalToWorld` objects per bone. Wiki
+    docs confirm `CopyBoneMatrix` is the faster copy-into-matrix variant.
+    A matrix comparison against the previous math matched within
+    ~1e-8 in the sampled case. Allocation around `RADAR:player:Draw`
+    dropped from roughly 91.6 KB/frame before the rewrite to about
+    4.0 KB/frame after it; live `RADAR:player:Draw` was then around
+    0.19 ms average / 0.8 ms max in the sampled scene.
+34. Dynamic `prop_dynamic` partial-view fallback hitch fixed. A close
+    table-focus view with 144 `prop_dynamic` mirrors showed fallback
+    allocation around 56 KB/frame and occasional draw stalls up to
+    ~36 ms. Scalarizing the fallback transform reduced fallback
+    allocation to ~22.6 KB/frame, but the real fix was using the baked
+    dynamic-prop mesh in partial views too: the same 3000-frame test
+    ended with `mirrors=0`, `DrawDynamicProps` ~0.003 ms average /
+    0.112 ms max, `DrawBakedDynamicProps` ~0.027 ms average /
+    0.242 ms max, and no real frames over 8 ms.
+35. LVS-heavy profiling with 12 LVS ships showed the big drops were
+    mostly outside this addon. Baseline with the holo table active:
+    `RADAR:lvs:Draw` ~0.082 ms average / 0.553 ms max, and the
+    `util.Effect` tracer wrapper averaged ~0.0385 ms per call. Worst
+    real frames were 35-52 ms while measured holo-table addon work on
+    those frames was only about 1.5-2.9 ms. With `DrawHologram` no-op'd,
+    similar 49-68 ms drops still occurred; with only the holo LVS radar
+    disabled, similar 49-56 ms drops still occurred. Conclusion: the
+    large frame drops are likely LVS / game-side ship activity, not the
+    holo-table radar. The radar can still gain optional headroom later
+    with marker-only / tracer-only modes, but that will not fix the
+    measured 50 ms spikes.
 
 ## Profiling baselines
 
@@ -390,10 +430,11 @@ rebuild was already cheap there:
 **gm_flatgrass** (~1.7 k faces): 5–15 ms warm/cold across all
 framings. Trivial.
 
-Take-away: imesh phase (~1.2 µs/tri in `Mesh:BuildFromTriangles`) is
-now the dominant cost on every all-in framing. Further wins require
-either avoiding the rebuild entirely (semi all-in cache) or skipping
-faces (more aggressive culling).
+Take-away: the imesh phase used to dominate all-in framings when built
+with `IMesh:BuildFromTriangles`; the current `mesh.Begin` static-IMesh
+path is much faster but still scales with emitted triangles. Further
+wins require either avoiding the rebuild entirely (semi all-in cache) or
+skipping faces (more aggressive culling).
 
 **Post-bake frame-time notes** (same Venator-like all-in scene, one
 visible table, scale 270):
@@ -414,6 +455,18 @@ visible table, scale 270):
   self-install only while holo tables exist and to use
   `ents.FindByClass('holo_table_3d')` instead of scanning
   `ents.Iterator()`.
+- Close table-focus view with 144 `prop_dynamic` mirrors, before
+  partial-view dynamic bake: `DrawDynamicProps` ~0.48 ms average with
+  rare stalls up to ~36 ms. After drawing the global baked dynamic-prop
+  mesh in partial views too: `mirrors=0`, `DrawDynamicProps`
+  ~0.003 ms average / 0.112 ms max, `DrawBakedDynamicProps`
+  ~0.027 ms average / 0.242 ms max, 3000-frame real-time max
+  ~5.85 ms and no frames over 8 ms in that sample.
+- LVS-heavy scene with 12 LVS ships: `RADAR:lvs:Draw` ~0.082 ms average
+  / 0.553 ms max; disabling the holo render or disabling only the holo
+  LVS radar did not remove 50 ms-class real-frame spikes. Treat those
+  spikes as mostly outside this addon unless a future profiler shows
+  different alignment.
 
 **Steady-state Lua allocation notes** (GC paused, one visible spawned
 table on the current test map):

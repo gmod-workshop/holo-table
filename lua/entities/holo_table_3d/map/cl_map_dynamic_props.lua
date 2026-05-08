@@ -2,6 +2,8 @@ local MapCache = ENT.MapCache
 local SysTime = SysTime
 local Mesh = Mesh
 local math_atan2 = math.atan2
+local math_sin = math.sin
+local math_cos = math.cos
 local math_sqrt = math.sqrt
 local math_pi = math.pi
 local coroutine_create = coroutine.create
@@ -15,6 +17,7 @@ local dynamicPropBakeCvar = MapCache.dynamicPropBakeCvar
 local CACHE_GENERATION = MapCache.CACHE_GENERATION
 local staticPropBakeMaterial = MapCache.staticPropBakeMaterial
 local addStaticPropBakeVert = MapCache.addStaticPropBakeVert
+local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
 local DYNAMIC_PROP_BAKE_HOOK = 'holo_table_3d.dynamic_prop_bake'
 local DYNAMIC_PROP_SCAN_INTERVAL = 1.0
 local DYNAMIC_PROP_BAKE_FRAME_BUDGET = 0.006
@@ -123,8 +126,7 @@ local function startDynamicPropBake(snapshot, signature)
                 coroutine_yield()
                 bumpDeadline()
             end
-            local msh = Mesh()
-            msh:BuildFromTriangles(verts)
+            local msh = buildMeshFromTriangles(verts)
             MapCache.dynamicPropBake.pendingMeshes[#MapCache.dynamicPropBake.pendingMeshes + 1] = {
                 mat = group.mat,
                 mesh = msh,
@@ -258,7 +260,10 @@ local PROP_DRAW_SCRATCH_ANG = MapCache.PROP_DRAW_SCRATCH_ANG
 -- Hot-loop math locals: avoids per-call global table lookups in the
 -- per-prop Euler-decomposition path.
 local atan2   = math_atan2
+local sin     = math_sin
+local cos     = math_cos
 local sqrt    = math_sqrt
+local DEG2RAD = math_pi / 180
 local RAD2DEG = 180 / math_pi
 
 local DYN_PROP_CACHE_TTL = 1.0
@@ -337,16 +342,14 @@ local function refreshDynamicPropMirrors(self, onlyUnbaked)
 end
 
 -- Draws baked prop_dynamic map dressing inside the holo scene matrix.
+-- The global GPU clip prism crops zoomed/partial views, so the baked path
+-- can replace the per-prop ClientsideModel fallback outside all-in views too.
 -- Returns true when the baked path handled the prop_dynamic layer this
 -- frame, even if there are zero props; callers use this to skip the csent
 -- fallback outside the matrix.
 function ENT:DrawBakedDynamicProps()
     if not dynamicPropBakeCvar:GetBool() then return false end
     if not self:GetMap() then return false end
-    if not self:CylinderHorizContainsMap(self:GetScale(), self:GetPanX(), self:GetPanY()) then
-        MapCache.startDynamicPropBakeWatch()
-        return false
-    end
     if not MapCache.dynamicPropBake or MapCache.dynamicPropBake.gen ~= CACHE_GENERATION then
         MapCache.startDynamicPropBakeWatch()
         return true
@@ -374,24 +377,56 @@ function ENT:DrawBakedDynamicProps()
 end
 
 -- Legacy prop_dynamic fallback. This mirrors the old radar module's
--- ClientsideModel path and is used for partial views, disabled bake, and
--- while the async map-owned bake is rebuilding.
+-- ClientsideModel path and is used for disabled bake or individual
+-- moving/unbaked props. While the async map-owned bake is rebuilding, the
+-- baked path suppresses this fallback for stable props.
 function ENT:DrawDynamicProps(onlyUnbaked)
     local mirrors = refreshDynamicPropMirrors(self, onlyUnbaked)
     if not mirrors then return end
 
     local selfTbl = self:GetTable()
     local invScale = selfTbl._holoInvScale
+    local toX, toY, toZ = selfTbl._holoOx, selfTbl._holoOy, selfTbl._holoOz
+    local tFx, tFy, tFz = selfTbl._holoFx, selfTbl._holoFy, selfTbl._holoFz
+    local tRx, tRy, tRz = selfTbl._holoRx, selfTbl._holoRy, selfTbl._holoRz
+    local tUx, tUy, tUz = selfTbl._holoUx, selfTbl._holoUy, selfTbl._holoUz
+    local scratchPos = PROP_DRAW_SCRATCH_POS
+    local scratchAng = PROP_DRAW_SCRATCH_ANG
+
     render.SuppressEngineLighting(true)
     for _, rec in pairs(mirrors) do
         local ent, csent = rec.ent, rec.csent
         if not (IsValid(ent) and IsValid(csent)) then continue end
 
         if csent:GetSkin() ~= ent:GetSkin() then csent:SetSkin(ent:GetSkin()) end
-        local wpos, wang = LocalToWorld(ent:GetPos() * invScale, ent:GetAngles(),
-            selfTbl._holoOrigin, selfTbl._holoAngles)
-        csent:SetPos(wpos)
-        csent:SetAngles(wang)
+
+        local pos = ent:GetPos()
+        local lx, ly, lz = pos.x * invScale, pos.y * invScale, pos.z * invScale
+        scratchPos:SetUnpacked(
+            toX + tFx * lx - tRx * ly + tUx * lz,
+            toY + tFy * lx - tRy * ly + tUy * lz,
+            toZ + tFz * lx - tRz * ly + tUz * lz)
+
+        local ang = ent:GetAngles()
+        local sp, cp = sin(ang.p * DEG2RAD), cos(ang.p * DEG2RAD)
+        local sy, cy = sin(ang.y * DEG2RAD), cos(ang.y * DEG2RAD)
+        local sr, cr = sin(ang.r * DEG2RAD), cos(ang.r * DEG2RAD)
+        local pFx, pFy, pFz =  cp * cy,                 cp * sy,                 -sp
+        local pRx, pRy, pRz = -sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp
+        local pUx, pUy, pUz =  cr * sp * cy + sr * sy,  cr * sp * sy - sr * cy,  cr * cp
+
+        local wFx = tFx * pFx - tRx * pFy + tUx * pFz
+        local wFy = tFy * pFx - tRy * pFy + tUy * pFz
+        local wFz = tFz * pFx - tRz * pFy + tUz * pFz
+        local wRz = tFz * pRx - tRz * pRy + tUz * pRz
+        local wUz = tFz * pUx - tRz * pUy + tUz * pUz
+        scratchAng:SetUnpacked(
+            atan2(-wFz, sqrt(wFx * wFx + wFy * wFy)) * RAD2DEG,
+            atan2(wFy, wFx) * RAD2DEG,
+            atan2(-wRz, wUz) * RAD2DEG)
+
+        csent:SetPos(scratchPos)
+        csent:SetAngles(scratchAng)
         csent:SetModelScale(invScale, 0)
         csent:SetupBones()
         csent:DrawModel()

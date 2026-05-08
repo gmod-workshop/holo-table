@@ -30,3 +30,26 @@ function MapCache.destroyMeshList(list)
         MapCacheEntity._SafeDestroyMesh(MapCacheEntity, item)
     end
 end
+
+function MapCache.buildMeshFromTriangles(verts)
+    local vertCount = #verts
+    if vertCount < 3 then return nil end
+    vertCount = vertCount - (vertCount % 3)
+
+    local msh = Mesh()
+    mesh.Begin(msh, MATERIAL_TRIANGLES, vertCount / 3)
+    for i = 1, vertCount do
+        local v = verts[i]
+        mesh.Position(v.pos)
+        if v.normal then mesh.Normal(v.normal) end
+        mesh.TexCoord(0, v.u or 0, v.v or 0)
+        if v.color then
+            local c = v.color
+            mesh.Color(c.r or 255, c.g or 255, c.b or 255, c.a or 255)
+        end
+        mesh.AdvanceVertex()
+    end
+    mesh.End()
+
+    return msh
+end

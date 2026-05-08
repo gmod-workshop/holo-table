@@ -22,6 +22,7 @@ local clipPolygonPlane = MapCache.clipPolygonPlane
 local getMatByTexinfo = MapCache.getMatByTexinfo
 local resolveMat = MapCache.resolveMat
 local resolveProj = MapCache.resolveProj
+local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
 function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     local bsp = bsp2 and bsp2.GetCurrent()
     if not bsp or not bsp.faces then return {} end
@@ -322,12 +323,12 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
     -- any partial IMesh allocations can be freed if the coroutine is
     -- abandoned mid-pass (entity removed, build restarted, etc.).
     --
-    -- BuildFromTriangles cost is roughly linear in vertex count
+    -- Static mesh.Begin cost is roughly linear in vertex count
     -- (~0.45 us/vert on 7th-gen hardware); a single group with ~30k
     -- verts spends ~13 ms in one unyieldable call and shows up as a
     -- frame hitch. Split big groups into MAX_VERTS_PER_MESH chunks
     -- (each one a separate IMesh under the same material) so every
-    -- BuildFromTriangles call stays under the frame budget. Multiple
+    -- mesh.End call stays under the frame budget. Multiple
     -- IMeshes per material cost one extra draw call apiece, which is
     -- cheap relative to the avoided stutter.
     --
@@ -365,8 +366,7 @@ function ENT:BuildClippedMap(scale, height, panX, panY, useYield, stats)
                     for i = take + 1, #chunkScratch do chunkScratch[i] = nil end
                     source = chunkScratch
                 end
-                local m = Mesh()
-                m:BuildFromTriangles(source)
+                local m = buildMeshFromTriangles(source)
                 list[#list + 1] = { mat = group.mat, mesh = m }
                 meshCount = meshCount + 1
                 offset = offset + take

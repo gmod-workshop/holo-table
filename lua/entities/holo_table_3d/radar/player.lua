@@ -210,14 +210,44 @@ local function syncMirrorMainAnimation(ply, mirror)
     cs:SetPlaybackRate(ply:GetPlaybackRate())
 end
 
+local SOURCE_ROOT_MTX = Matrix()
+local SOURCE_ROOT_INV_MTX = Matrix()
+local TARGET_ROOT_MTX = Matrix()
+local SOURCE_BONE_MTX = Matrix()
+local LOCAL_BONE_MTX = Matrix()
+local TARGET_BONE_MTX = Matrix()
+local BONE_SCALE_VEC = Vector()
+
+local function getMirrorBoneIds(ply, mirror)
+    local cs = mirror.csent
+    local plyBoneCount = ply:GetBoneCount() or 0
+    local mirrorBoneCount = cs:GetBoneCount() or 0
+
+    if mirror.ValidBoneIds and mirror.ValidPlyBoneCount == plyBoneCount
+        and mirror.ValidMirrorBoneCount == mirrorBoneCount then
+        return mirror.ValidBoneIds
+    end
+
+    local boneCount = math.min(plyBoneCount, mirrorBoneCount)
+    local ids = {}
+    for boneId = 0, boneCount - 1 do
+        if cs:GetBoneName(boneId) ~= '__INVALIDBONE__' then
+            ids[#ids + 1] = boneId
+        end
+    end
+
+    mirror.ValidBoneIds = ids
+    mirror.ValidPlyBoneCount = plyBoneCount
+    mirror.ValidMirrorBoneCount = mirrorBoneCount
+    return ids
+end
+
 local function copyLocalBonePose(ply, mirror, rootPos, rootAng, invScale)
     if not localBonePoseCvar:GetBool() then return end
 
     local cs = mirror.csent
-    local plyBoneCount = ply:GetBoneCount() or 0
-    local mirrorBoneCount = cs:GetBoneCount() or 0
-    local boneCount = math.min(plyBoneCount, mirrorBoneCount)
-    if boneCount <= 0 then return end
+    local boneIds = getMirrorBoneIds(ply, mirror)
+    if #boneIds == 0 then return end
 
     local sourcePos = ply:GetPos()
     local sourceAng = ply:GetAngles()
@@ -225,26 +255,37 @@ local function copyLocalBonePose(ply, mirror, rootPos, rootAng, invScale)
     ply:SetupBones()
     cs:SetupBones()
 
-    for boneId = 0, boneCount - 1 do
-        if cs:GetBoneName(boneId) == '__INVALIDBONE__' then continue end
+    SOURCE_ROOT_MTX:Identity()
+    SOURCE_ROOT_MTX:SetTranslation(sourcePos)
+    SOURCE_ROOT_MTX:SetAngles(sourceAng)
+    SOURCE_ROOT_INV_MTX:Set(SOURCE_ROOT_MTX)
+    SOURCE_ROOT_INV_MTX:InvertTR()
 
-        local sourceMatrix = ply:GetBoneMatrix(boneId)
-        if not sourceMatrix then continue end
+    TARGET_ROOT_MTX:Identity()
+    TARGET_ROOT_MTX:SetTranslation(rootPos)
+    TARGET_ROOT_MTX:SetAngles(rootAng)
 
-        local localPos, localAng = WorldToLocal(
-            sourceMatrix:GetTranslation(),
-            sourceMatrix:GetAngles(),
-            sourcePos,
-            sourceAng
-        )
-        local targetPos, targetAng = LocalToWorld(localPos * invScale, localAng, rootPos, rootAng)
+    BONE_SCALE_VEC:SetUnpacked(invScale, invScale, invScale)
 
-        local targetMatrix = Matrix()
-        targetMatrix:SetTranslation(targetPos)
-        targetMatrix:SetAngles(targetAng)
-        targetMatrix:SetScale(sourceMatrix:GetScale() * invScale)
+    for i = 1, #boneIds do
+        local boneId = boneIds[i]
+        if ply.CopyBoneMatrix then
+            ply:CopyBoneMatrix(boneId, SOURCE_BONE_MTX)
+        else
+            local sourceMatrix = ply:GetBoneMatrix(boneId)
+            if not sourceMatrix then continue end
+            SOURCE_BONE_MTX:Set(sourceMatrix)
+        end
 
-        cs:SetBoneMatrix(boneId, targetMatrix)
+        LOCAL_BONE_MTX:Set(SOURCE_ROOT_INV_MTX)
+        LOCAL_BONE_MTX:Mul(SOURCE_BONE_MTX)
+        LOCAL_BONE_MTX:ScaleTranslation(invScale)
+
+        TARGET_BONE_MTX:Set(TARGET_ROOT_MTX)
+        TARGET_BONE_MTX:Mul(LOCAL_BONE_MTX)
+        TARGET_BONE_MTX:Scale(BONE_SCALE_VEC)
+
+        cs:SetBoneMatrix(boneId, TARGET_BONE_MTX)
     end
 end
 

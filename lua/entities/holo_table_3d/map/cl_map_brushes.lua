@@ -11,6 +11,7 @@ local SURF_SKIP_MASK = MapCache.SURF_SKIP_MASK
 local getMatByTexinfo = MapCache.getMatByTexinfo
 local loadTexdataMaterial = MapCache.loadTexdataMaterial
 local unlitWrap = MapCache.unlitWrap
+local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
 local brushMeshCache = {}
 
 function MapCache.clearBrushMeshCache()
@@ -105,8 +106,7 @@ function ENT:GetBrushModelMeshes(modelIndex)
     local list = {}
     for _, g in pairs(groups) do
         if #g.verts > 0 then
-            local msh = Mesh()
-            msh:BuildFromTriangles(g.verts)
+            local msh = buildMeshFromTriangles(g.verts)
             list[#list + 1] = { mat = g.mat, mesh = msh }
         end
     end

@@ -21,7 +21,7 @@ local staticPropBakeCvar = CreateClientConVar('holo_table_staticprop_bake', '1',
 local staticPropBakeModeCvar = CreateClientConVar('holo_table_staticprop_bake_mode', '3', true, false,
     'Static prop bake mode: 0 legacy, 1 global all-in bake, 2 per-prop baked cull, 3 global GPU-clipped bake.')
 local dynamicPropBakeCvar = CreateClientConVar('holo_table_dynamicprop_bake', '1', true, false,
-    'Use baked prop_dynamic meshes for all-in holo table views.')
+    'Use baked prop_dynamic meshes for holo table views.')
 
 -- Sub-pixel cull threshold in holo units (table-local space). At typical
 -- viewing distances 1 holo unit ≈ 2 screen pixels, so 0.5 ≈ 1 px. Any

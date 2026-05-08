@@ -20,6 +20,7 @@ local PROP_SUBPIXEL_THRESHOLD = MapCache.PROP_SUBPIXEL_THRESHOLD
 local CACHE_GENERATION = MapCache.CACHE_GENERATION
 local getPropBounds = MapCache.getPropBounds
 local getPropDrawEnt = MapCache.getPropDrawEnt
+local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
 local PROP_DRAW_SCRATCH_POS = MapCache.PROP_DRAW_SCRATCH_POS
 local PROP_DRAW_SCRATCH_ANG = MapCache.PROP_DRAW_SCRATCH_ANG
 local atan2 = math_atan2
@@ -140,8 +141,7 @@ function MapCache.startStaticPropBake(scale)
                 coroutine_yield()
                 bumpDeadline()
             end
-            local msh = Mesh()
-            msh:BuildFromTriangles(verts)
+            local msh = buildMeshFromTriangles(verts)
             MapCache.staticPropBake.meshes[#MapCache.staticPropBake.meshes + 1] = { mat = group.mat, mesh = msh }
             MapCache.staticPropBake.outputVerts = MapCache.staticPropBake.outputVerts + n
             group.verts = {}
@@ -301,8 +301,7 @@ function MapCache.startStaticPropPerPropBake(scale)
                 coroutine_yield()
                 bumpDeadline()
             end
-            local msh = Mesh()
-            msh:BuildFromTriangles(verts)
+            local msh = buildMeshFromTriangles(verts)
             local item = { mat = group.mat, mesh = msh }
             meshes[#meshes + 1] = item
             MapCache.staticPropPerPropBake.pendingMeshes[#MapCache.staticPropPerPropBake.pendingMeshes + 1] = item

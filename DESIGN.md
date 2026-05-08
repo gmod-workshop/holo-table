@@ -187,6 +187,16 @@ prints stage-by-stage timings (`clip` vs `imesh`), face counts
 list is freed without touching the live build pipeline so profiling is
 side-effect-free.
 
+**Decision:** Static IMeshes are built through `mesh.Begin(msh,
+MATERIAL_TRIANGLES, triCount)`, not `IMesh:BuildFromTriangles`. This is
+centralized in `MapCache.buildMeshFromTriangles` so every map fragment
+uses the same emitter and chunk-size assumptions. GMod wiki docs confirm
+the `mesh.Begin(IMesh, primitiveType, primitiveCount)` form; local
+profiling on the same table/map dropped warm `holo_table_profile` runs
+from roughly 83-92 ms total (75-84 ms in the imesh phase) to roughly
+30-32 ms total (21-22 ms imesh phase). Keep generated chunks below the
+static mesh vertex limit documented for `mesh.Begin`.
+
 **Decision:** `cl_map.lua` owns an explicit hot-reload cleanup hook via
 `_G.HOLO_TABLE_3D_CL_MAP_CLEANUP`. On file load it runs the previous
 generation's cleanup before installing the new one, freeing shared
@@ -236,16 +246,28 @@ suppression the props look noticeably darker than the surrounding mesh.
 
 **Decision:** `prop_dynamic` map dressing belongs to the map subsystem,
 not radar. Most map `prop_dynamic`s are static visual dressing, so
-`cl_map.lua` owns an async baked IMesh path for horizontally all-in views
-plus a per-table csent fallback for partial views, disabled bake, or
-individual moving props. While an all-in bake is queued/building, the
-baked path suppresses the fallback instead of spawning temporary mirrors.
-A 1-second watcher compares
+`cl_map.lua` owns an async baked IMesh path drawn inside the holo scene
+matrix. The existing GPU clip prism crops that global bake in zoomed /
+partial views, so stable props do not need per-prop `ClientsideModel`
+mirrors just because the table is zoomed in. The per-table csent
+fallback remains for disabled bake and individual moving props. While a
+bake is queued/building, the baked path suppresses the stable-prop
+fallback instead of spawning temporary mirrors. A 1-second watcher
+compares
 `EntIndex`, model, skin, position, and angles; added/removed/reskinned
 stable props trigger an async rebuild while the previous bake keeps
 drawing. Props observed moving/rotating are marked unbaked and drawn by
 fallback instead of forcing a rebuild every watcher tick. Toggle:
 `holo_table_dynamicprop_bake`.
+
+**Decision:** Keep the dynamic-prop csent fallback allocation-light even
+though it should be rare. The fallback uses the same scalar projection
+math as `RadarBase:Project` and shared scratch `Vector` / `Angle` objects
+instead of `LocalToWorld(ent:GetPos() * invScale, ent:GetAngles(), ...)`.
+This reduced fallback allocation from roughly 56 KB/frame to roughly
+22.6 KB/frame in a 144-mirror table-focus sample. The preferred path is
+still the baked partial-view renderer, which reduced that same scene to
+zero dynamic mirrors and kept `DrawDynamicProps` around 0.003 ms average.
 
 **Rejected: leaving `prop_dynamic` in radar.** Profiling showed
 `radar/prop_dynamic.lua:Draw` dominated the post-static-bake radar cost.
@@ -346,6 +368,15 @@ after `SetupBones()`, including scaled bone translations and bone scale.
 This preserves locomotion, weapon hold poses, firing gestures, and reload
 animations. Toggle for debugging: `holo_table_player_anim_events`.
 
+**Decision:** The local player bone-copy path uses cached bone IDs,
+reusable matrices, and `Entity:CopyBoneMatrix` when available. The wiki
+documents `CopyBoneMatrix` as the faster copy-into-provided-matrix form
+of `GetBoneMatrix`; local comparison against the previous
+`WorldToLocal`/`LocalToWorld` math matched within floating-point noise in
+the sampled case. This keeps the high-fidelity local mirror while
+dropping `RADAR:player:Draw` allocation from roughly 91.6 KB/frame to
+about 4 KB/frame in the measured scene.
+
 **Decision:** Player radar models use neutral model lighting instead of
 map lighting. `Entity:DrawModel` in the projected holo position samples
 the map's lighting there, so players can become nearly black on dark
@@ -389,6 +420,15 @@ effect. The holo renders the result as short-lived projected beams in
 the radar layer. This is intentionally clientside and opportunistic:
 if an LVS weapon bypasses `util.Effect` or does not expose a bullet
 entry, the table simply will not show that tracer.
+
+**Profiling note:** In a scene with 12 active LVS ships,
+`RADAR:lvs:Draw` measured about 0.082 ms average / 0.553 ms max, and the
+`util.Effect` tracer wrapper averaged about 0.0385 ms per call. Large
+35-68 ms real-frame drops persisted when `DrawHologram` was no-op'd and
+when only the holo LVS radar was disabled, while measured holo-table work
+on those slow frames was only a few milliseconds. Treat major LVS-heavy
+FPS dips as likely LVS / game-side cost unless a future profile shows
+the spike aligned with this addon's radar code.
 
 ## Scale pivot and pan
 
@@ -730,7 +770,7 @@ that is a separate budget from frame steady state.
   duplicate. Low priority — most affected dressing is occluded by
   surrounding interior geometry anyway.
 - **Brush-entity cost.** Static props and `prop_dynamic` map dressing
-  now have baked all-in paths, so brush entities are often the next
+  now have baked GPU-clipped paths, so brush entities are often the next
   meaningful steady-frame cost. Recent allocation profiling showed
   `DrawBrushEntities` at ~15.5 KB/frame on a map with 118 brush-model
   entities, mostly from live entity pose/matrix work. A future pass
