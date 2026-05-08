@@ -1,6 +1,5 @@
 local MapCache = ENT.MapCache
 local SysTime = SysTime
-local Mesh = Mesh
 local math_atan2 = math.atan2
 local math_sin = math.sin
 local math_cos = math.cos

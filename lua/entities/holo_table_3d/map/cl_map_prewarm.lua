@@ -85,7 +85,7 @@ function MapCache.startTriCachePrewarm()
             for ei = 1, n do
                 local v = edges[ei][1]
                 local dx, dy, dz = v.x - cx, v.y - cy, v.z - cz
-                local d2 = dx*dx + dy*dy + dz*dz
+                local d2 = dx * dx + dy * dy + dz * dz
                 if d2 > r2max then r2max = d2 end
             end
             face._holoCull = { cx = cx, cy = cy, cz = cz, fr = math_sqrt(r2max) }

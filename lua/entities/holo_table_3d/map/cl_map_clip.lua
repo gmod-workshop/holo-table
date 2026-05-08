@@ -1,7 +1,6 @@
 local MapCache = ENT.MapCache
 local SysTime = SysTime
 local Vector = Vector
-local Mesh = Mesh
 local bit_band = bit.band
 local table_move = table.move
 local math_sin = math.sin

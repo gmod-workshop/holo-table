@@ -1,7 +1,6 @@
 local MapCache = ENT.MapCache
 local SysTime = SysTime
 local Vector = Vector
-local Mesh = Mesh
 local bit_band = bit.band
 local math_sqrt = math.sqrt
 local hook_Add = hook.Add
